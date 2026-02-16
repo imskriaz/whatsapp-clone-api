@@ -99,7 +99,14 @@ class ServiceManager {
     }
 }
 
-// Create singleton instance
+// Create and export singleton instance
 const serviceManager = new ServiceManager();
 
-module.exports = serviceManager;
+// Export both the manager and individual functions for backward compatibility
+module.exports = {
+    ServiceManager,
+    serviceManager,
+    startServices: (manager, store, config) => serviceManager.start(manager, store, config),
+    stopServices: () => serviceManager.stop(),
+    getServiceStatus: () => serviceManager.getStatus()
+};

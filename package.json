@@ -30,7 +30,9 @@
   },
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js",
+    "dev": "nodemon --inspect app.js",
+    "dev:fast": "nodemon --ignore 'data/*' --ignore 'logs/*' --delay 500 app.js",
+    "dev:debug": "nodemon --inspect-brk app.js",
     "prod": "NODE_ENV=production node app.js",
     "pm2": "pm2 start ecosystem.config.js",
     "pm2:stop": "pm2 stop whatsapp-clone-api",
@@ -45,16 +47,9 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:unit": "jest tests/unit",
-    "test:integration": "jest tests/integration",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "format": "prettier --write \"src/**/*.js\"",
-    "docker:build": "docker build -t whatsapp-clone-api .",
-    "docker:run": "docker run -p 3000:3000 -v $(pwd)/data:/app/data whatsapp-clone-api",
-    "docker:compose": "docker-compose up -d",
-    "docker:compose:down": "docker-compose down",
-    "prepare": "husky install"
+    "format": "prettier --write \"src/**/*.js\""
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.0",

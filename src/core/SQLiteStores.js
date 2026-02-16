@@ -140,6 +140,9 @@ class SQLiteStores {
      * @returns {Promise<this>}
      */
     async init() {
+        // Check if already initialized
+        if (this.db) return this;
+        
         const maxRetries = 3;
         let lastError;
 
@@ -150,19 +153,41 @@ class SQLiteStores {
                     fs.mkdirSync(dir, { recursive: true });
                 }
 
+                // Open with faster settings
                 this.db = await open({
                     filename: this.dbPath,
-                    driver: sqlite3.Database
+                    driver: sqlite3.Database,
+                    mode: sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE
                 });
 
-                if (!this.pragmaSet) {
-                    await this._setPragmas();
+                // Set essential pragmas only (remove non-essential ones for startup)
+                await this.db.exec('PRAGMA foreign_keys = ON');
+                await this.db.exec('PRAGMA journal_mode = WAL');
+                await this.db.exec('PRAGMA synchronous = NORMAL');
+                
+                // Defer less critical pragmas
+                setImmediate(async () => {
+                    try {
+                        await this.db.exec('PRAGMA cache_size = -2000');
+                        await this.db.exec('PRAGMA temp_store = MEMORY');
+                        await this.db.exec('PRAGMA mmap_size = 30000000000');
+                    } catch (e) {
+                        // Ignore errors
+                    }
+                });
+
+                // Create tables if not exist (fast check)
+                const tablesExist = await this.db.get(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+                );
+                
+                if (!tablesExist) {
+                    await this.createTables();
                 }
 
-                await this.createTables();
                 this._emit('init', { sessionId: this.sessionId });
                 
-                console.log(`[SQLite] Initialized: ${this.dbPath}`);
+                console.log(`[SQLite] Initialized: ${this.dbPath} in ${Date.now() - global.appStart}ms`);
                 return this;
 
             } catch (error) {
@@ -170,7 +195,7 @@ class SQLiteStores {
                 console.error(`[SQLite] Init attempt ${attempt} failed:`, error.message);
                 
                 if (attempt < maxRetries) {
-                    await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
                 }
             }
         }
@@ -602,11 +627,11 @@ class SQLiteStores {
                 retry_count INTEGER DEFAULT 3,
                 timeout INTEGER DEFAULT 10000,
                 secret TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_triggered DATETIME,
                 last_response INTEGER,
                 failure_count INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 UNIQUE(session_id, event)
             )

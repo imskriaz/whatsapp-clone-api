@@ -1,0 +1,24 @@
+// nodemon.json
+{
+  "watch": ["src", "app.js"],
+  "ignore": [
+    "node_modules/*",
+    "data/*",
+    "logs/*",
+    "public/*",
+    "tests/*",
+    "*.test.js",
+    "*.spec.js"
+  ],
+  "ext": "js,json",
+  "delay": "1000",
+  "execMap": {
+    "js": "node --trace-warnings"
+  },
+  "env": {
+    "NODE_ENV": "development"
+  },
+  "events": {
+    "restart": "echo '🔄 App restarted'"
+  }
+}

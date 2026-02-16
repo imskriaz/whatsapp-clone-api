@@ -1,0 +1,14 @@
+// .nodemonignore
+data/
+logs/
+node_modules/
+.git/
+coverage/
+tests/
+*.test.js
+*.spec.js
+.DS_Store
+*.log
+*.db
+*.db-*
+*.sqlite

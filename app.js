@@ -88,7 +88,7 @@ class App {
             this.store = new SQLiteStores(null, process.env.DB_PATH || './data/db.db');
             await this.store.init();
 
-            // Run migrations if needed
+            // Run migrations if needed (with safe checks)
             await this.runMigrations();
 
             // Set default settings if not exist
@@ -107,7 +107,7 @@ class App {
     }
 
     /**
-     * Run database migrations
+     * Run database migrations safely
      */
     async runMigrations() {
         try {
@@ -124,56 +124,156 @@ class App {
                         executed_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 `);
+                logger.info('Created migrations table');
             }
 
             // Get executed migrations
             const executed = await this.store.db.all('SELECT name FROM migrations');
             const executedNames = new Set(executed.map(m => m.name));
 
-            // Define migrations
+            // Define migrations with proper checks
             const migrations = [
                 {
                     name: '001_initial',
-                    sql: `
-                        -- Initial schema is already created by SQLiteStores.js
-                    `
+                    check: async () => {
+                        // Check if any tables exist
+                        const tables = await this.store.db.all(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        );
+                        return tables.length > 0;
+                    },
+                    run: async () => {
+                        // Initial schema is already created by SQLiteStores.js
+                        logger.info('Initial schema already exists');
+                    }
                 },
                 {
-                    name: '002_add_indexes',
-                    sql: `
-                        CREATE INDEX IF NOT EXISTS idx_messages_ts ON msgs(ts);
-                        CREATE INDEX IF NOT EXISTS idx_chats_unread ON chats(unread);
-                        CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);
-                    `
+                    name: '002_add_webhook_columns',
+                    check: async () => {
+                        // Check if columns already exist
+                        const tableInfo = await this.store.db.all(
+                            "PRAGMA table_info(webhooks)"
+                        );
+                        const columns = tableInfo.map(c => c.name);
+                        return !columns.includes('last_triggered');
+                    },
+                    run: async () => {
+                        logger.info('Adding webhook columns...');
+                        
+                        // Check if table exists first
+                        const tableExists = await this.store.db.get(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name='webhooks'"
+                        );
+                        
+                        if (tableExists) {
+                            // Add columns one by one with error handling
+                            try {
+                                await this.store.db.exec(
+                                    "ALTER TABLE webhooks ADD COLUMN last_triggered DATETIME"
+                                );
+                                logger.info('Added last_triggered column');
+                            } catch (err) {
+                                if (!err.message.includes('duplicate column')) {
+                                    throw err;
+                                }
+                                logger.debug('last_triggered column already exists');
+                            }
+
+                            try {
+                                await this.store.db.exec(
+                                    "ALTER TABLE webhooks ADD COLUMN last_response INTEGER"
+                                );
+                                logger.info('Added last_response column');
+                            } catch (err) {
+                                if (!err.message.includes('duplicate column')) {
+                                    throw err;
+                                }
+                                logger.debug('last_response column already exists');
+                            }
+
+                            try {
+                                await this.store.db.exec(
+                                    "ALTER TABLE webhooks ADD COLUMN failure_count INTEGER DEFAULT 0"
+                                );
+                                logger.info('Added failure_count column');
+                            } catch (err) {
+                                if (!err.message.includes('duplicate column')) {
+                                    throw err;
+                                }
+                                logger.debug('failure_count column already exists');
+                            }
+                        }
+                    }
                 },
                 {
-                    name: '003_add_webhook_stats',
-                    sql: `
-                        ALTER TABLE webhooks ADD COLUMN last_triggered DATETIME;
-                        ALTER TABLE webhooks ADD COLUMN last_response INTEGER;
-                        ALTER TABLE webhooks ADD COLUMN failure_count INTEGER DEFAULT 0;
-                    `
+                    name: '003_add_indexes',
+                    check: async () => {
+                        // Check if indexes exist
+                        const indexes = await this.store.db.all(
+                            "SELECT name FROM sqlite_master WHERE type='index'"
+                        );
+                        return !indexes.some(i => i.name === 'idx_webhook_session');
+                    },
+                    run: async () => {
+                        logger.info('Creating indexes...');
+                        
+                        const indexes = [
+                            `CREATE INDEX IF NOT EXISTS idx_webhook_session ON webhooks(session_id, enabled)`,
+                            `CREATE INDEX IF NOT EXISTS idx_webhook_event ON webhooks(session_id, event)`,
+                            `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries ON webhook_deliveries(webhook_id, created_at DESC)`,
+                            `CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id, created_at DESC)`,
+                            `CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_logs(session_id, created_at DESC)`,
+                            `CREATE INDEX IF NOT EXISTS idx_backups_session ON backups(session_id, created_at DESC)`
+                        ];
+
+                        for (const sql of indexes) {
+                            try {
+                                await this.store.db.exec(sql);
+                            } catch (err) {
+                                logger.warn(`Failed to create index: ${sql}`, err.message);
+                            }
+                        }
+                    }
                 }
             ];
 
             // Run pending migrations
             for (const migration of migrations) {
                 if (!executedNames.has(migration.name)) {
-                    logger.info(`Running migration: ${migration.name}`);
+                    logger.info(`Checking migration: ${migration.name}`);
                     
-                    await this.store.db.exec('BEGIN TRANSACTION');
-                    try {
-                        await this.store.db.exec(migration.sql);
+                    // Check if migration is needed
+                    const needed = await migration.check();
+                    
+                    if (needed) {
+                        logger.info(`Running migration: ${migration.name}`);
+                        
+                        await this.store.db.exec('BEGIN TRANSACTION');
+                        try {
+                            await migration.run();
+                            await this.store.db.run(
+                                'INSERT INTO migrations (name) VALUES (?)',
+                                [migration.name]
+                            );
+                            await this.store.db.exec('COMMIT');
+                            logger.info(`✅ Migration completed: ${migration.name}`);
+                        } catch (error) {
+                            await this.store.db.exec('ROLLBACK');
+                            logger.error(`❌ Migration failed: ${migration.name}`, error);
+                            
+                            // Don't throw for non-critical migrations
+                            if (!migration.name.includes('webhook')) {
+                                throw error;
+                            }
+                        }
+                    } else {
+                        logger.info(`Migration not needed: ${migration.name}`);
+                        
+                        // Mark as executed even if not needed
                         await this.store.db.run(
                             'INSERT INTO migrations (name) VALUES (?)',
                             [migration.name]
-                        );
-                        await this.store.db.exec('COMMIT');
-                        logger.info(`✅ Migration completed: ${migration.name}`);
-                    } catch (error) {
-                        await this.store.db.exec('ROLLBACK');
-                        logger.error(`❌ Migration failed: ${migration.name}`, error);
-                        throw error;
+                        ).catch(() => {});
                     }
                 }
             }
@@ -341,36 +441,33 @@ class App {
             });
         });
 
-        // API routes
+        // API routes (mounted at /api)
         this.app.use('/api', routes(this.manager, this.store));
 
-        // Serve HTML pages
-        this.app.get('/', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/index.html'));
+        // Web routes (mounted at root)
+        const webRoutes = require('./src/web/routes');
+        this.app.use('/', webRoutes);
+
+        // Static files
+        this.app.use('/public', express.static(path.join(__dirname, 'public')));
+        this.app.use('/css', express.static(path.join(__dirname, 'public/css')));
+        this.app.use('/js', express.static(path.join(__dirname, 'public/js')));
+        this.app.use('/views', express.static(path.join(__dirname, 'public/views')));
+
+        // 404 handler for API routes (non-web)
+        this.app.use('/api/*', (req, res) => {
+            res.status(404).json({ error: 'API route not found' });
         });
 
-        this.app.get('/dashboard', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/dashboard.html'));
+        // 404 handler for web routes
+        this.app.use((req, res) => {
+            // Check if it's an API request
+            if (req.path.startsWith('/api/')) {
+                return res.status(404).json({ error: 'API route not found' });
+            }
+            // Serve web 404 page
+            res.status(404).sendFile(path.join(__dirname, 'public/views/pages/404.html'));
         });
-
-        this.app.get('/login', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/login.html'));
-        });
-
-        this.app.get('/register', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/register.html'));
-        });
-
-        this.app.get('/session/:sid', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/session.html'));
-        });
-
-        this.app.get('/admin', (req, res) => {
-            res.sendFile(path.join(__dirname, 'public/views/admin.html'));
-        });
-
-        // 404 handler
-        this.app.use(notFound);
 
         // Error handler
         this.app.use(errorHandler);
