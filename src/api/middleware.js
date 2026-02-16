@@ -1,11 +1,14 @@
 // src/api/middleware.js
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const logger = require('../utils/logger');
+const { maskString } = require('../utils/helpers');
+const { ROLES, DEFAULT_PERMISSIONS, ERROR_CODES } = require('../utils/constants');
 
 /**
  * Role definitions and default permissions
  */
-const ROLES = {
+const ROLES_CONFIG = {
     SUPERADMIN: 'superadmin',     // Full system access
     ADMIN: 'admin',                // Can manage everything except users & sessions
     MODERATOR: 'moderator',        // Can moderate WhatsApp content
@@ -16,7 +19,7 @@ const ROLES = {
 /**
  * Default permissions by role
  */
-const DEFAULT_PERMISSIONS = {
+const PERMISSIONS = {
     // User management
     MANAGE_USERS: ['superadmin'],
     MANAGE_SESSIONS: ['superadmin'],
@@ -58,42 +61,23 @@ const DEFAULT_PERMISSIONS = {
 };
 
 /**
- * Check if user has permission (considering user meta overrides)
- * @param {Object} user - User object
- * @param {string} permission - Permission to check
- * @param {Object} userMeta - User meta data (cached)
- * @returns {boolean}
+ * User meta cache with TTL
  */
-const hasPermission = (user, permission, userMeta = {}) => {
-    if (!user) return false;
-    
-    // Superadmin always has all permissions
-    if (user.role === ROLES.SUPERADMIN) return true;
-    
-    // Check user meta override first
-    const metaPermission = userMeta[`perm_${permission}`];
-    if (metaPermission !== undefined) {
-        return metaPermission === 'true' || metaPermission === true;
-    }
-    
-    // Check role-based permission
-    const allowedRoles = DEFAULT_PERMISSIONS[permission];
-    return allowedRoles ? allowedRoles.includes(user.role) : false;
-};
+const userMetaCache = new Map();
+const META_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Get user meta with caching
  * @param {Object} store - SQLiteStores instance
  * @param {string} username - Username
- * @param {Object} cache - Cache object
  * @returns {Promise<Object>}
  */
-const getUserMeta = async (store, username, cache = null) => {
-    const cacheKey = `user_meta:${username}`;
+const getUserMeta = async (store, username) => {
+    const cacheKey = `meta:${username}`;
+    const cached = userMetaCache.get(cacheKey);
     
-    // Check cache
-    if (cache && cache[cacheKey]) {
-        return cache[cacheKey];
+    if (cached && Date.now() - cached.timestamp < META_CACHE_TTL) {
+        return cached.data;
     }
     
     try {
@@ -116,34 +100,75 @@ const getUserMeta = async (store, username, cache = null) => {
             }
         });
         
-        // Cache if cache provided
-        if (cache) {
-            cache[cacheKey] = parsed;
-        }
+        // Cache the result
+        userMetaCache.set(cacheKey, {
+            data: parsed,
+            timestamp: Date.now()
+        });
         
         return parsed;
-    } catch (err) {
-        console.error('Error getting user meta:', err);
+        
+    } catch (error) {
+        logger.error('Error getting user meta', { username, error: error.message });
         return {};
     }
 };
 
 /**
+ * Clear user meta cache
+ * @param {string} username - Username (optional)
+ */
+const clearUserMetaCache = (username = null) => {
+    if (username) {
+        userMetaCache.delete(`meta:${username}`);
+    } else {
+        userMetaCache.clear();
+    }
+};
+
+/**
+ * Check if user has permission (considering user meta overrides)
+ * @param {Object} user - User object
+ * @param {string} permission - Permission to check
+ * @returns {boolean}
+ */
+const hasPermission = (user, permission) => {
+    if (!user) return false;
+    
+    // Superadmin always has all permissions
+    if (user.role === ROLES_CONFIG.SUPERADMIN) return true;
+    
+    // Check user meta override first
+    if (user.meta?.permissions && user.meta.permissions[permission] !== undefined) {
+        return user.meta.permissions[permission];
+    }
+    
+    // Check role-based permission
+    const allowedRoles = PERMISSIONS[permission];
+    return allowedRoles ? allowedRoles.includes(user.role) : false;
+};
+
+/**
  * Authentication middleware
  * @param {Object} store - SQLiteStores instance
- * @param {Object} options - Options
  * @returns {Function} Express middleware
  */
-const auth = (store, options = {}) => {
-    const userMetaCache = {};
-    
+const auth = (store) => {
     return async (req, res, next) => {
         const apiKey = req.headers['x-api-key'];
+        const requestId = req.id || `req_${Date.now()}`;
         
         if (!apiKey) {
+            logger.warn('Missing API key', { 
+                requestId, 
+                ip: req.ip, 
+                path: req.path 
+            });
+            
             return res.status(401).json({ 
                 error: 'API key required',
-                code: 'MISSING_API_KEY'
+                code: 'MISSING_API_KEY',
+                requestId
             });
         }
 
@@ -151,19 +176,35 @@ const auth = (store, options = {}) => {
             const user = await store.getUserByApiKey(apiKey);
             
             if (!user) {
+                logger.warn('Invalid API key', { 
+                    requestId, 
+                    ip: req.ip,
+                    key: maskString(apiKey)
+                });
+                
                 return res.status(401).json({ 
                     error: 'Invalid API key',
-                    code: 'INVALID_API_KEY'
+                    code: 'INVALID_API_KEY',
+                    requestId
                 });
             }
 
+            // Get user meta with caching
+            const meta = await getUserMeta(store, user.username);
+
             // Check if user is expired
-            const meta = await getUserMeta(store, user.username, userMetaCache);
             if (meta.expiry && meta.expiry < new Date()) {
+                logger.warn('Expired account', { 
+                    requestId, 
+                    username: user.username,
+                    expiry: meta.expiry
+                });
+                
                 return res.status(403).json({ 
                     error: 'Account expired',
                     code: 'ACCOUNT_EXPIRED',
-                    expiry: meta.expiry
+                    expiry: meta.expiry,
+                    requestId
                 });
             }
 
@@ -175,24 +216,38 @@ const auth = (store, options = {}) => {
             };
 
             // Check API access permission
-            if (!hasPermission(req.user, 'API_ACCESS', meta.permissions)) {
+            if (!hasPermission(req.user, 'API_ACCESS')) {
+                logger.warn('API access denied', { 
+                    requestId, 
+                    username: user.username,
+                    role: user.role
+                });
+                
                 return res.status(403).json({ 
                     error: 'API access denied',
-                    code: 'API_ACCESS_DENIED'
+                    code: 'API_ACCESS_DENIED',
+                    requestId
                 });
             }
 
-            // Log access for audit
-            if (process.env.NODE_ENV === 'development') {
-                console.log(`[AUTH] ${user.username} (${user.role}) accessed ${req.method} ${req.url}`);
-            }
+            logger.debug('Authentication successful', { 
+                requestId, 
+                username: user.username,
+                role: user.role
+            });
 
             next();
-        } catch (err) {
-            console.error('Auth error:', err.message);
+
+        } catch (error) {
+            logger.error('Authentication error', { 
+                requestId, 
+                error: error.message 
+            });
+            
             return res.status(500).json({ 
                 error: 'Authentication failed',
-                code: 'AUTH_ERROR'
+                code: 'AUTH_ERROR',
+                requestId
             });
         }
     };
@@ -204,8 +259,6 @@ const auth = (store, options = {}) => {
  * @returns {Function} Express middleware
  */
 const optionalAuth = (store) => {
-    const userMetaCache = {};
-    
     return async (req, res, next) => {
         const apiKey = req.headers['x-api-key'];
         
@@ -218,7 +271,7 @@ const optionalAuth = (store) => {
             const user = await store.getUserByApiKey(apiKey);
             
             if (user) {
-                const meta = await getUserMeta(store, user.username, userMetaCache);
+                const meta = await getUserMeta(store, user.username);
                 
                 // Check expiry but don't block optional auth
                 if (!meta.expiry || meta.expiry >= new Date()) {
@@ -236,7 +289,8 @@ const optionalAuth = (store) => {
             }
             
             next();
-        } catch (err) {
+            
+        } catch (error) {
             req.user = null;
             next();
         }
@@ -250,25 +304,37 @@ const optionalAuth = (store) => {
  */
 const requirePermission = (permission) => {
     return (req, res, next) => {
+        const requestId = req.id || `req_${Date.now()}`;
+        
         if (!req.user) {
+            logger.warn('Authentication required', { 
+                requestId, 
+                path: req.path,
+                permission
+            });
+            
             return res.status(401).json({ 
                 error: 'Authentication required',
-                code: 'UNAUTHORIZED'
+                code: 'UNAUTHORIZED',
+                requestId
             });
         }
 
-        const hasPerm = hasPermission(
-            req.user, 
-            permission, 
-            req.user.meta?.permissions || {}
-        );
-
-        if (!hasPerm) {
+        if (!hasPermission(req.user, permission)) {
+            logger.warn('Insufficient permissions', { 
+                requestId, 
+                username: req.user.username,
+                role: req.user.role,
+                required: permission,
+                path: req.path
+            });
+            
             return res.status(403).json({ 
                 error: 'Insufficient permissions',
                 code: 'FORBIDDEN',
                 required: permission,
-                userRole: req.user.role
+                userRole: req.user.role,
+                requestId
             });
         }
 
@@ -283,24 +349,42 @@ const requirePermission = (permission) => {
  */
 const allowRoles = (allowedRoles) => {
     return (req, res, next) => {
+        const requestId = req.id || `req_${Date.now()}`;
+        
         if (!req.user) {
+            logger.warn('Authentication required', { 
+                requestId, 
+                path: req.path,
+                allowedRoles
+            });
+            
             return res.status(401).json({ 
                 error: 'Authentication required',
-                code: 'UNAUTHORIZED'
+                code: 'UNAUTHORIZED',
+                requestId
             });
         }
 
         // Superadmin always passes role checks
-        if (req.user.role === ROLES.SUPERADMIN) {
+        if (req.user.role === ROLES_CONFIG.SUPERADMIN) {
             return next();
         }
 
         if (!allowedRoles.includes(req.user.role)) {
+            logger.warn('Access denied by role', { 
+                requestId, 
+                username: req.user.username,
+                userRole: req.user.role,
+                required: allowedRoles,
+                path: req.path
+            });
+            
             return res.status(403).json({ 
                 error: 'Access denied',
                 code: 'FORBIDDEN',
                 required: allowedRoles,
-                userRole: req.user.role
+                userRole: req.user.role,
+                requestId
             });
         }
 
@@ -315,36 +399,53 @@ const allowRoles = (allowedRoles) => {
  */
 const sessionOwner = (manager) => {
     return async (req, res, next) => {
+        const requestId = req.id || `req_${Date.now()}`;
         const sid = req.params.sid;
         
         if (!sid) {
             return res.status(400).json({ 
                 error: 'Session ID required',
-                code: 'MISSING_SESSION_ID'
+                code: 'MISSING_SESSION_ID',
+                requestId
             });
         }
 
         const session = manager.get(sid);
         
         if (!session) {
+            logger.warn('Session not found', { 
+                requestId, 
+                sid,
+                username: req.user?.username
+            });
+            
             return res.status(404).json({ 
                 error: 'Session not found',
-                code: 'SESSION_NOT_FOUND'
+                code: 'SESSION_NOT_FOUND',
+                requestId
             });
         }
 
         req.session = session;
 
         // Superadmin can access any session
-        if (req.user.role === ROLES.SUPERADMIN) {
+        if (req.user.role === ROLES_CONFIG.SUPERADMIN) {
             return next();
         }
 
         // Check ownership
         if (session.uid !== req.user.username) {
+            logger.warn('Session ownership mismatch', { 
+                requestId, 
+                sid,
+                sessionUser: session.uid,
+                requestUser: req.user.username
+            });
+            
             return res.status(403).json({ 
                 error: 'Access denied',
-                code: 'NOT_SESSION_OWNER'
+                code: 'NOT_SESSION_OWNER',
+                requestId
             });
         }
 
@@ -353,11 +454,19 @@ const sessionOwner = (manager) => {
         const userSessionCount = manager.countForUser(req.user.username);
         
         if (userSessionCount > sessionLimit) {
+            logger.warn('Session limit exceeded', { 
+                requestId, 
+                username: req.user.username,
+                limit: sessionLimit,
+                current: userSessionCount
+            });
+            
             return res.status(403).json({ 
                 error: 'Session limit exceeded',
                 code: 'SESSION_LIMIT_EXCEEDED',
                 limit: sessionLimit,
-                current: userSessionCount
+                current: userSessionCount,
+                requestId
             });
         }
 
@@ -368,7 +477,7 @@ const sessionOwner = (manager) => {
 /**
  * Rate limiter with user meta override
  * @param {Object} store - SQLiteStores instance
- * @returns {Function} Express middleware
+ * @returns {Function} Express middleware factory
  */
 const createRateLimiter = (store) => {
     const userRateLimits = new Map();
@@ -383,7 +492,8 @@ const createRateLimiter = (store) => {
             },
             standardHeaders: true,
             legacyHeaders: false,
-            keyGenerator: (req) => req.user?.username || req.ip
+            keyGenerator: (req) => req.user?.username || req.ip,
+            skip: (req) => req.user?.role === ROLES_CONFIG.SUPERADMIN // Skip for superadmin
         });
 
         return async (req, res, next) => {
@@ -391,7 +501,7 @@ const createRateLimiter = (store) => {
             if (req.user && req.user.meta?.rate_limit) {
                 const userLimit = req.user.meta.rate_limit;
                 
-                // Create user-specific limiter
+                // Create or get user-specific limiter
                 if (!userRateLimits.has(req.user.username)) {
                     userRateLimits.set(req.user.username, rateLimit({
                         windowMs: options.windowMs || 15 * 60 * 1000,
@@ -423,16 +533,26 @@ const createRateLimiter = (store) => {
  */
 const mediaSizeLimit = () => {
     return (req, res, next) => {
+        const requestId = req.id || `req_${Date.now()}`;
+        
         if (!req.user) return next();
         
         const mediaLimit = req.user.meta?.media_limit || 100 * 1024 * 1024; // Default 100MB
         
         if (req.file && req.file.size > mediaLimit) {
+            logger.warn('Media size exceeded', { 
+                requestId, 
+                username: req.user.username,
+                size: req.file.size,
+                limit: mediaLimit
+            });
+            
             return res.status(413).json({
                 error: 'Media size exceeds limit',
                 code: 'MEDIA_SIZE_EXCEEDED',
                 limit: mediaLimit,
-                size: req.file.size
+                size: req.file.size,
+                requestId
             });
         }
         
@@ -453,13 +573,14 @@ const validate = {
             .isLength({ min: 3, max: 30 })
             .withMessage('Username must be 3-30 characters')
             .matches(/^[a-zA-Z0-9_]+$/)
-            .withMessage('Username can only contain letters, numbers, and underscores'),
+            .withMessage('Username can only contain letters, numbers, and underscores')
+            .toLowerCase(),
         body('password')
             .isLength({ min: 6 })
             .withMessage('Password must be at least 6 characters'),
         body('role')
             .optional()
-            .isIn([ROLES.USER, ROLES.SUBSCRIBER])
+            .isIn([ROLES_CONFIG.USER, ROLES_CONFIG.SUBSCRIBER])
             .withMessage('Role must be user or subscriber')
     ],
 
@@ -467,7 +588,7 @@ const validate = {
      * Validate login
      */
     login: [
-        body('username').notEmpty().withMessage('Username required'),
+        body('username').notEmpty().withMessage('Username required').toLowerCase(),
         body('password').notEmpty().withMessage('Password required')
     ],
 
@@ -477,7 +598,7 @@ const validate = {
     updateUser: [
         body('role')
             .optional()
-            .isIn([ROLES.ADMIN, ROLES.MODERATOR, ROLES.USER, ROLES.SUBSCRIBER])
+            .isIn([ROLES_CONFIG.ADMIN, ROLES_CONFIG.MODERATOR, ROLES_CONFIG.USER, ROLES_CONFIG.SUBSCRIBER])
             .withMessage('Invalid role'),
         body('password')
             .optional()
@@ -504,16 +625,7 @@ const validate = {
         body('expiry')
             .optional()
             .isISO8601()
-            .withMessage('Expiry must be a valid date'),
-        body('*')
-            .custom((value, { req }) => {
-                // Allow any key that starts with 'perm_'
-                const key = req.path.split('/').pop();
-                if (key && key.startsWith('perm_')) {
-                    return true;
-                }
-                return true;
-            })
+            .withMessage('Expiry must be a valid date')
     ],
 
     /**
@@ -528,6 +640,8 @@ const validate = {
             .optional()
             .isString()
             .withMessage('Device must be a string')
+            .isLength({ max: 50 })
+            .withMessage('Device too long')
     ],
 
     /**
@@ -542,7 +656,10 @@ const validate = {
         body('type')
             .optional()
             .isIn(['text', 'image', 'video', 'audio', 'document', 'sticker', 'location', 'contact'])
-            .withMessage('Invalid message type')
+            .withMessage('Invalid message type'),
+        body('content')
+            .notEmpty()
+            .withMessage('Content required')
     ],
 
     /**
@@ -652,7 +769,9 @@ const validate = {
             .notEmpty()
             .withMessage('Key required')
             .isLength({ max: 50 })
-            .withMessage('Key too long'),
+            .withMessage('Key too long')
+            .matches(/^[a-zA-Z0-9_]+$/)
+            .withMessage('Key can only contain letters, numbers, and underscores'),
         body('value')
             .optional()
     ],
@@ -685,6 +804,16 @@ const validate = {
             }
             next();
         }
+    ],
+
+    /**
+     * Validate backup creation
+     */
+    createBackup: [
+        body('includes_media')
+            .optional()
+            .isBoolean()
+            .withMessage('includes_media must be boolean')
     ]
 };
 
@@ -698,13 +827,21 @@ const handleValidationErrors = (req, res, next) => {
     const errors = validationResult(req);
     
     if (!errors.isEmpty()) {
+        const requestId = req.id || `req_${Date.now()}`;
+        
+        logger.debug('Validation failed', { 
+            requestId, 
+            errors: errors.array() 
+        });
+        
         return res.status(400).json({
             error: 'Validation failed',
             code: 'VALIDATION_ERROR',
             details: errors.array().map(e => ({
                 field: e.param,
                 message: e.msg
-            }))
+            })),
+            requestId
         });
     }
     
@@ -719,23 +856,33 @@ const handleValidationErrors = (req, res, next) => {
  */
 const requestLogger = (req, res, next) => {
     const start = Date.now();
+    const requestId = req.id || `req_${Date.now()}`;
+    req.id = requestId;
     
+    // Log request
+    logger.http(`${req.method} ${req.url}`, {
+        requestId,
+        method: req.method,
+        url: req.url,
+        ip: req.ip,
+        userAgent: req.get('User-Agent')
+    });
+
+    // Log response on finish
     res.on('finish', () => {
         const duration = Date.now() - start;
-        const log = {
-            timestamp: new Date().toISOString(),
+        const logLevel = res.statusCode >= 400 ? 'warn' : 'http';
+        
+        logger[logLevel](`${req.method} ${req.url} ${res.statusCode} ${duration}ms`, {
+            requestId,
             method: req.method,
             url: req.url,
             status: res.statusCode,
-            duration: `${duration}ms`,
-            ip: req.ip,
-            user: req.user?.username || 'anonymous',
-            role: req.user?.role || 'none'
-        };
-        
-        console.log(JSON.stringify(log));
+            duration,
+            user: req.user?.username
+        });
     });
-    
+
     next();
 };
 
@@ -747,41 +894,63 @@ const requestLogger = (req, res, next) => {
  * @param {Function} next - Express next
  */
 const errorHandler = (err, req, res, next) => {
-    console.error('Error:', {
-        message: err.message,
+    const requestId = req.id || `req_${Date.now()}`;
+    
+    logger.error('Request error', {
+        requestId,
+        error: err.message,
         stack: err.stack,
         url: req.url,
         method: req.method,
         user: req.user?.username,
-        role: req.user?.role
+        body: req.body
     });
 
     // Handle specific error types
     if (err.code === 'SQLITE_CONSTRAINT') {
         return res.status(409).json({
             error: 'Duplicate or constraint violation',
-            code: 'CONSTRAINT_ERROR'
+            code: 'CONSTRAINT_ERROR',
+            requestId
         });
     }
 
     if (err.code === 'SQLITE_BUSY') {
         return res.status(503).json({
             error: 'Database busy, try again',
-            code: 'DB_BUSY'
+            code: 'DB_BUSY',
+            requestId
         });
     }
 
     if (err.message.includes('socket') || err.message.includes('connection')) {
         return res.status(503).json({
             error: 'WhatsApp connection error',
-            code: 'CONNECTION_ERROR'
+            code: 'CONNECTION_ERROR',
+            requestId
         });
     }
 
     if (err.name === 'ValidationError') {
         return res.status(400).json({
             error: err.message,
-            code: 'VALIDATION_ERROR'
+            code: 'VALIDATION_ERROR',
+            requestId
+        });
+    }
+
+    if (err.name === 'MulterError') {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(413).json({
+                error: 'File too large',
+                code: 'FILE_TOO_LARGE',
+                requestId
+            });
+        }
+        return res.status(400).json({
+            error: err.message,
+            code: 'UPLOAD_ERROR',
+            requestId
         });
     }
 
@@ -790,7 +959,8 @@ const errorHandler = (err, req, res, next) => {
     res.status(status).json({
         error: err.message || 'Internal server error',
         code: err.code || 'INTERNAL_ERROR',
-        ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+        ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+        requestId
     });
 };
 
@@ -800,10 +970,19 @@ const errorHandler = (err, req, res, next) => {
  * @param {Object} res - Express response
  */
 const notFound = (req, res) => {
+    const requestId = req.id || `req_${Date.now()}`;
+    
+    logger.warn('Route not found', {
+        requestId,
+        url: req.url,
+        method: req.method
+    });
+    
     res.status(404).json({
         error: 'Route not found',
         code: 'NOT_FOUND',
-        path: req.url
+        path: req.url,
+        requestId
     });
 };
 
@@ -814,9 +993,12 @@ const notFound = (req, res) => {
  * @param {Function} next - Express next
  */
 const cors = (req, res, next) => {
-    res.header('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+    const origin = process.env.CORS_ORIGIN || '*';
+    
+    res.header('Access-Control-Allow-Origin', origin);
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, x-api-key');
+    res.header('Access-Control-Expose-Headers', 'X-Request-ID');
     
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
@@ -832,10 +1014,18 @@ const jsonParser = (req, res, next) => {
     const express = require('express');
     express.json({ limit: '50mb' })(req, res, err => {
         if (err) {
+            const requestId = req.id || `req_${Date.now()}`;
+            
+            logger.warn('JSON parse error', {
+                requestId,
+                error: err.message
+            });
+            
             return res.status(413).json({
                 error: 'Request entity too large',
                 code: 'PAYLOAD_TOO_LARGE',
-                limit: '50mb'
+                limit: '50mb',
+                requestId
             });
         }
         next();
@@ -872,11 +1062,25 @@ const isValidContentType = (type) => {
     return valid.includes(type);
 };
 
+/**
+ * Cleanup middleware (runs after response)
+ */
+const cleanup = (req, res, next) => {
+    res.on('finish', () => {
+        // Cleanup temporary data if any
+        if (req.cleanup) {
+            req.cleanup();
+        }
+    });
+    next();
+};
+
 module.exports = {
-    ROLES,
-    DEFAULT_PERMISSIONS,
+    ROLES: ROLES_CONFIG,
+    PERMISSIONS,
     hasPermission,
     getUserMeta,
+    clearUserMetaCache,
     auth,
     optionalAuth,
     requirePermission,
@@ -889,14 +1093,24 @@ module.exports = {
         max: 5,
         message: { error: 'Too many accounts created', code: 'RATE_LIMIT_EXCEEDED' },
         standardHeaders: true,
-        legacyHeaders: false
+        legacyHeaders: false,
+        keyGenerator: (req) => req.ip
     }),
     loginLimiter: rateLimit({
         windowMs: 15 * 60 * 1000,
         max: 10,
         message: { error: 'Too many login attempts', code: 'RATE_LIMIT_EXCEEDED' },
         standardHeaders: true,
-        legacyHeaders: false
+        legacyHeaders: false,
+        keyGenerator: (req) => req.ip
+    }),
+    apiLimiter: rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 100,
+        message: { error: 'Too many requests', code: 'RATE_LIMIT_EXCEEDED' },
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: (req) => req.user?.username || req.ip
     }),
     validate,
     handleValidationErrors,
@@ -905,6 +1119,7 @@ module.exports = {
     notFound,
     cors,
     jsonParser,
+    cleanup,
     isValidSessionId,
     isValidJid,
     isValidContentType

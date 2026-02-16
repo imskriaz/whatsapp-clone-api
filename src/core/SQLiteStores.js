@@ -9,6 +9,9 @@ class LRUCache {
     constructor(maxSize = 1000) {
         this.cache = new Map();
         this.maxSize = maxSize;
+        this.hits = 0;
+        this.misses = 0;
+        this.evictions = 0;
     }
 
     /**
@@ -18,10 +21,22 @@ class LRUCache {
      */
     get(key) {
         const item = this.cache.get(key);
-        if (!item) return null;
+        if (!item) {
+            this.misses++;
+            return null;
+        }
+        
+        // Check if expired
+        if (item.expiry && item.expiry < Date.now()) {
+            this.cache.delete(key);
+            this.misses++;
+            return null;
+        }
+        
         // Refresh item (move to end)
         this.cache.delete(key);
         this.cache.set(key, item);
+        this.hits++;
         return item.value;
     }
 
@@ -29,15 +44,22 @@ class LRUCache {
      * Set value in cache
      * @param {string} key - Cache key
      * @param {any} value - Value to cache
+     * @param {number} ttl - Time to live in ms (optional)
      */
-    set(key, value) {
+    set(key, value, ttl = null) {
         // Enforce size limit
         if (this.cache.size >= this.maxSize) {
             // Remove oldest (first item)
             const firstKey = this.cache.keys().next().value;
             this.cache.delete(firstKey);
+            this.evictions++;
         }
-        this.cache.set(key, { value });
+        
+        this.cache.set(key, {
+            value,
+            expiry: ttl ? Date.now() + ttl : null,
+            added: Date.now()
+        });
     }
 
     /**
@@ -66,6 +88,25 @@ class LRUCache {
      */
     clear() {
         this.cache.clear();
+        this.hits = 0;
+        this.misses = 0;
+        this.evictions = 0;
+    }
+
+    /**
+     * Get cache stats
+     * @returns {Object} Cache statistics
+     */
+    getStats() {
+        const total = this.hits + this.misses;
+        return {
+            size: this.cache.size,
+            maxSize: this.maxSize,
+            hits: this.hits,
+            misses: this.misses,
+            evictions: this.evictions,
+            hitRate: total > 0 ? ((this.hits / total) * 100).toFixed(2) + '%' : '0%'
+        };
     }
 }
 
@@ -77,9 +118,18 @@ class SQLiteStores {
         this.cache = new LRUCache(1000);
         this.pragmaSet = false;
         this.isClosed = false;
+        this.transactionDepth = 0;
+        this.preparedStmts = new Map();
         this.cbs = {
             message: [], presence: [], chat: [], reaction: [],
-            group: [], error: [], init: [], close: []
+            group: [], lid: [], error: [], init: [], close: []
+        };
+        this.stats = {
+            queries: 0,
+            writes: 0,
+            errors: 0,
+            cacheHits: 0,
+            startTime: Date.now()
         };
     }
 
@@ -90,45 +140,80 @@ class SQLiteStores {
      * @returns {Promise<this>}
      */
     async init() {
-        try {
-            const dir = path.dirname(this.dbPath);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
+        const maxRetries = 3;
+        let lastError;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const dir = path.dirname(this.dbPath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+
+                this.db = await open({
+                    filename: this.dbPath,
+                    driver: sqlite3.Database
+                });
+
+                if (!this.pragmaSet) {
+                    await this._setPragmas();
+                }
+
+                await this.createTables();
+                this._emit('init', { sessionId: this.sessionId });
+                
+                console.log(`[SQLite] Initialized: ${this.dbPath}`);
+                return this;
+
+            } catch (error) {
+                lastError = error;
+                console.error(`[SQLite] Init attempt ${attempt} failed:`, error.message);
+                
+                if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+                }
             }
-
-            this.db = await open({
-                filename: this.dbPath,
-                driver: sqlite3.Database
-            });
-
-            if (!this.pragmaSet) {
-                await this.db.exec('PRAGMA foreign_keys = ON');
-                await this.db.exec('PRAGMA journal_mode = WAL');
-                await this.db.exec('PRAGMA synchronous = NORMAL');
-                await this.db.exec('PRAGMA cache_size = -2000');
-                await this.db.exec('PRAGMA temp_store = MEMORY');
-                await this.db.exec('PRAGMA mmap_size = 30000000000');
-                await this.db.exec('PRAGMA busy_timeout = 5000');
-                this.pragmaSet = true;
-            }
-
-            await this.createTables();
-            this._emit('init', { sessionId: this.sessionId });
-            return this;
-        } catch (error) {
-            this._emit('error', error);
-            throw error;
         }
+
+        this._emit('error', lastError);
+        throw lastError;
+    }
+
+    /**
+     * Set SQLite pragmas for performance
+     * @private
+     */
+    async _setPragmas() {
+        const pragmas = [
+            'PRAGMA foreign_keys = ON',
+            'PRAGMA journal_mode = WAL',
+            'PRAGMA synchronous = NORMAL',
+            'PRAGMA cache_size = -2000',
+            'PRAGMA temp_store = MEMORY',
+            'PRAGMA mmap_size = 30000000000',
+            'PRAGMA busy_timeout = 5000',
+            'PRAGMA page_size = 4096',
+            'PRAGMA wal_autocheckpoint = 1000'
+        ];
+
+        for (const pragma of pragmas) {
+            try {
+                await this.db.exec(pragma);
+            } catch (error) {
+                console.warn(`[SQLite] Failed to set pragma: ${pragma}`, error.message);
+            }
+        }
+
+        this.pragmaSet = true;
     }
 
     /**
      * Create all database tables
-     * @private
      */
     async createTables() {
-        // ==================== CORE TABLES ====================
-        
-        await this.db.exec(`
+        const tables = [
+            // ==================== CORE TABLES ====================
+            `
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 password TEXT NOT NULL,
@@ -137,9 +222,8 @@ class SQLiteStores {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS user_meta (
                 username TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -149,9 +233,8 @@ class SQLiteStores {
                 FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE,
                 PRIMARY KEY (username, key)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 device_id TEXT,
@@ -165,9 +248,8 @@ class SQLiteStores {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS session_meta (
                 session_id TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -177,9 +259,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, key)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS global_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT,
@@ -187,9 +268,8 @@ class SQLiteStores {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS user_sessions (
                 username TEXT NOT NULL,
                 session_id TEXT NOT NULL,
@@ -200,11 +280,10 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (username, session_id)
             )
-        `);
+            `,
 
-        // ==================== WHATSAPP DATA TABLES ====================
-
-        await this.db.exec(`
+            // ==================== WHATSAPP DATA TABLES ====================
+            `
             CREATE TABLE IF NOT EXISTS chats (
                 session_id TEXT NOT NULL,
                 jid TEXT NOT NULL,
@@ -229,9 +308,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, jid)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS contacts (
                 session_id TEXT NOT NULL,
                 jid TEXT NOT NULL,
@@ -256,9 +334,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, jid)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS msgs (
                 session_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -286,9 +363,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, chat) REFERENCES chats(session_id, jid) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, id)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS receipts (
                 session_id TEXT NOT NULL,
                 msg_id TEXT NOT NULL,
@@ -301,9 +377,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, msg_id) REFERENCES msgs(session_id, id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, msg_id, participant, type)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS media (
                 session_id TEXT NOT NULL,
                 msg_id TEXT NOT NULL,
@@ -327,9 +402,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, msg_id) REFERENCES msgs(session_id, id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, msg_id)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS reactions (
                 session_id TEXT NOT NULL,
                 msg_id TEXT NOT NULL,
@@ -344,9 +418,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, msg_id) REFERENCES msgs(session_id, id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, msg_id, reactor)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS groups (
                 session_id TEXT NOT NULL,
                 jid TEXT NOT NULL,
@@ -374,9 +447,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, jid) REFERENCES chats(session_id, jid) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, jid)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS group_members (
                 session_id TEXT NOT NULL,
                 group_jid TEXT NOT NULL,
@@ -398,9 +470,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, group_jid) REFERENCES groups(session_id, jid) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, group_jid, member)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS blocklist (
                 session_id TEXT NOT NULL,
                 jid TEXT NOT NULL,
@@ -410,9 +481,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, jid)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS calls (
                 session_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -430,9 +500,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, id)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS labels (
                 session_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -448,9 +517,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, id)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS label_assoc (
                 session_id TEXT NOT NULL,
                 label_id TEXT NOT NULL,
@@ -462,9 +530,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, label_id) REFERENCES labels(session_id, id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, label_id, target)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS newsletters (
                 session_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -482,9 +549,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, id)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS newsletter_posts (
                 session_id TEXT NOT NULL,
                 nid TEXT NOT NULL,
@@ -505,9 +571,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, nid) REFERENCES newsletters(session_id, id) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, nid, pid)
             )
-        `);
-
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS newsletter_reacts (
                 session_id TEXT NOT NULL,
                 nid TEXT NOT NULL,
@@ -523,12 +588,10 @@ class SQLiteStores {
                 FOREIGN KEY (session_id, nid, pid) REFERENCES newsletter_posts(session_id, nid, pid) ON DELETE CASCADE,
                 PRIMARY KEY (session_id, nid, pid, reactor)
             )
-        `);
+            `,
 
-        // ==================== META TABLES (Only essential for n8n) ====================
-
-        // Webhooks - For n8n integration
-        await this.db.exec(`
+            // ==================== META TABLES ====================
+            `
             CREATE TABLE IF NOT EXISTS webhooks (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -547,10 +610,8 @@ class SQLiteStores {
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 UNIQUE(session_id, event)
             )
-        `);
-
-        // Webhook delivery logs - For monitoring
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS webhook_deliveries (
                 id TEXT PRIMARY KEY,
                 webhook_id TEXT NOT NULL,
@@ -567,10 +628,8 @@ class SQLiteStores {
                 FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )
-        `);
-
-        // Backups - Track backup operations
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS backups (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -585,10 +644,8 @@ class SQLiteStores {
                 metadata TEXT,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )
-        `);
-
-        // Activity logs - Audit trail
-        await this.db.exec(`
+            `,
+            `
             CREATE TABLE IF NOT EXISTS activity_logs (
                 id TEXT PRIMARY KEY,
                 session_id TEXT,
@@ -603,44 +660,70 @@ class SQLiteStores {
                 duration INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        `);
+            `
+        ];
 
-        // ==================== INDEXES ====================
+        for (const sql of tables) {
+            try {
+                await this.db.exec(sql);
+            } catch (error) {
+                console.error('[SQLite] Failed to create table:', error.message);
+                throw error;
+            }
+        }
 
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_updated ON chats(updated_at)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_unread ON chats(session_id, unread)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msgs_chat ON msgs(session_id, chat, ts)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msgs_ts ON msgs(session_id, ts)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msgs_status ON msgs(session_id, status)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_msgs_starred ON msgs(session_id, starred)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_lid ON contacts(session_id, lid)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_presence ON contacts(session_id, presence)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(session_id, name)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_group_members ON group_members(session_id, group_jid, member)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(session_id, ts)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(session_id, status)`);
-        
-        // Meta table indexes
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_session ON webhooks(session_id, enabled)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_event ON webhooks(session_id, event)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries ON webhook_deliveries(webhook_id, created_at DESC)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id, created_at DESC)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_logs(session_id, created_at DESC)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_logs(action, created_at DESC)`);
-        await this.db.exec(`CREATE INDEX IF NOT EXISTS idx_backups_session ON backups(session_id, created_at DESC)`);
+        await this.createIndexes();
+    }
+
+    /**
+     * Create indexes for performance
+     */
+    async createIndexes() {
+        const indexes = [
+            `CREATE INDEX IF NOT EXISTS idx_chats_updated ON chats(updated_at)`,
+            `CREATE INDEX IF NOT EXISTS idx_chats_unread ON chats(session_id, unread)`,
+            `CREATE INDEX IF NOT EXISTS idx_msgs_chat ON msgs(session_id, chat, ts)`,
+            `CREATE INDEX IF NOT EXISTS idx_msgs_ts ON msgs(session_id, ts)`,
+            `CREATE INDEX IF NOT EXISTS idx_msgs_status ON msgs(session_id, status)`,
+            `CREATE INDEX IF NOT EXISTS idx_msgs_starred ON msgs(session_id, starred)`,
+            `CREATE INDEX IF NOT EXISTS idx_contacts_lid ON contacts(session_id, lid)`,
+            `CREATE INDEX IF NOT EXISTS idx_contacts_presence ON contacts(session_id, presence)`,
+            `CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(session_id, name)`,
+            `CREATE INDEX IF NOT EXISTS idx_group_members ON group_members(session_id, group_jid, member)`,
+            `CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(session_id, ts)`,
+            `CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(session_id, status)`,
+            `CREATE INDEX IF NOT EXISTS idx_webhook_session ON webhooks(session_id, enabled)`,
+            `CREATE INDEX IF NOT EXISTS idx_webhook_event ON webhooks(session_id, event)`,
+            `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries ON webhook_deliveries(webhook_id, created_at DESC)`,
+            `CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id, created_at DESC)`,
+            `CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_logs(session_id, created_at DESC)`,
+            `CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_logs(action, created_at DESC)`,
+            `CREATE INDEX IF NOT EXISTS idx_backups_session ON backups(session_id, created_at DESC)`
+        ];
+
+        for (const sql of indexes) {
+            try {
+                await this.db.exec(sql);
+            } catch (error) {
+                console.warn('[SQLite] Failed to create index:', error.message);
+            }
+        }
     }
 
     // ==================== CALLBACK SYSTEM ====================
 
     /**
      * Register event callback
-     * @param {string} event - Event name (message, presence, chat, reaction, group, error, init, close)
+     * @param {string} event - Event name
      * @param {Function} cb - Callback function
      * @returns {Function} Unsubscribe function
      */
     on(event, cb) {
-        if (!this.cbs[event]) this.cbs[event] = [];
+        if (!this.cbs[event]) {
+            this.cbs[event] = [];
+        }
         this.cbs[event].push(cb);
+        
         return () => {
             this.cbs[event] = this.cbs[event].filter(fn => fn !== cb);
         };
@@ -653,20 +736,65 @@ class SQLiteStores {
      * @param {any} data - Event data
      */
     _emit(event, data) {
-        if (!this.cbs[event]) return;
-        for (const cb of this.cbs[event]) {
-            try { 
-                cb(data); 
-            } catch (e) { 
-                console.error(`Error in ${event} callback:`, e); 
+        const callbacks = this.cbs[event];
+        if (!callbacks || !callbacks.length) return;
+        
+        for (const cb of callbacks) {
+            try {
+                cb(data);
+            } catch (error) {
+                console.error(`[SQLite] Error in ${event} callback:`, error);
             }
+        }
+    }
+
+    // ==================== TRANSACTION MANAGEMENT ====================
+
+    /**
+     * Begin transaction
+     * @returns {Promise<Object>} Transaction object
+     */
+    async beginTransaction() {
+        if (this.transactionDepth === 0) {
+            await this.db.exec('BEGIN IMMEDIATE');
+        }
+        this.transactionDepth++;
+        
+        return {
+            commit: async () => {
+                this.transactionDepth--;
+                if (this.transactionDepth === 0) {
+                    await this.db.exec('COMMIT');
+                }
+            },
+            rollback: async () => {
+                this.transactionDepth = 0;
+                await this.db.exec('ROLLBACK');
+            }
+        };
+    }
+
+    /**
+     * Execute in transaction
+     * @param {Function} fn - Function to execute
+     * @returns {Promise<any>} Result
+     */
+    async transaction(fn) {
+        const tx = await this.beginTransaction();
+        try {
+            const result = await fn();
+            await tx.commit();
+            return result;
+        } catch (error) {
+            await tx.rollback();
+            throw error;
         }
     }
 
     // ==================== GENERIC CRUD ====================
 
     /**
-     * Insert or update record
+     * Insert or update record with retry logic
      * @param {string} table - Table name
      * @param {Object} data - Record data
      * @param {Array} keys - Primary key fields
@@ -687,57 +815,125 @@ class SQLiteStores {
             }
         }
 
-        // Filter out internal fields
-        const cols = Object.keys(data).filter(k => !k.startsWith('_'));
+        // Validate required fields
+        for (const key of keys) {
+            if (data[key] === undefined || data[key] === null) {
+                throw new Error(`Missing required field: ${key}`);
+            }
+        }
+
+        // Filter out internal fields and undefined values
+        const cols = Object.keys(data).filter(k => 
+            !k.startsWith('_') && data[k] !== undefined
+        );
+        
         if (cols.length === 0) return null;
 
-        const vals = cols.map(c => data[c]);
+        const vals = cols.map(c => {
+            const val = data[c];
+            // Handle special types
+            if (val === null) return null;
+            if (typeof val === 'object') return JSON.stringify(val);
+            if (typeof val === 'boolean') return val ? 1 : 0;
+            return val;
+        });
+
+        // Build update clause
+        const updateCols = cols.filter(c => 
+            !keys.includes(c) && c !== 'created_at' && c !== 'updated_at'
+        ).map(c => `${c} = ?`).join(', ');
         
-        // Build update clause (exclude keys and created_at)
-        const updateCols = cols.filter(c => !keys.includes(c) && c !== 'created_at')
-            .map(c => `${c} = ?`).join(',');
+        const conflictTarget = keys.join(', ');
         
-        // Handle case where no columns to update
         let sql;
         if (updateCols) {
             sql = `
-                INSERT INTO ${table} (${cols.join(',')}) 
-                VALUES (${cols.map(() => '?').join(',')})
-                ON CONFLICT(${keys.join(',')}) DO UPDATE SET 
+                INSERT INTO ${table} (${cols.join(', ')}) 
+                VALUES (${cols.map(() => '?').join(', ')})
+                ON CONFLICT(${conflictTarget}) DO UPDATE SET 
                 ${updateCols}, updated_at = CURRENT_TIMESTAMP
             `;
         } else {
             sql = `
-                INSERT INTO ${table} (${cols.join(',')}) 
-                VALUES (${cols.map(() => '?').join(',')})
-                ON CONFLICT(${keys.join(',')}) DO UPDATE SET 
+                INSERT INTO ${table} (${cols.join(', ')}) 
+                VALUES (${cols.map(() => '?').join(', ')})
+                ON CONFLICT(${conflictTarget}) DO UPDATE SET 
                 updated_at = CURRENT_TIMESTAMP
             `;
         }
 
-        let retryCount = 0;
+        // Execute with retry
+        return this._executeWithRetry(sql, vals, { table, data });
+    }
+
+    /**
+     * Execute query with retry logic
+     * @private
+     * @param {string} sql - SQL query
+     * @param {Array} params - Query parameters
+     * @param {Object} context - Context for error logging
+     * @returns {Promise<Object>} SQLite result
+     */
+    async _executeWithRetry(sql, params, context = {}) {
         const maxRetries = 3;
-        
-        while (retryCount < maxRetries) {
+        let lastError;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const result = await this.db.run(sql, vals);
+                this.stats.queries++;
+                if (sql.trim().toLowerCase().startsWith('insert') || 
+                    sql.trim().toLowerCase().startsWith('update')) {
+                    this.stats.writes++;
+                }
                 
-                // Clear cache
-                const cacheKey = `${table}:${keys.map(k => data[k]).join(':')}`;
-                this.cache.delete(cacheKey);
-                this.cache.deletePattern(`${table}:list:*`);
+                const result = await this.db.run(sql, params);
+                
+                // Clear cache if this was a write operation
+                if (context.table && context.data) {
+                    const keys = context.keys || Object.keys(context.data).filter(k => 
+                        !k.startsWith('_')
+                    );
+                    const cacheKey = `${context.table}:${keys.map(k => context.data[k]).join(':')}`;
+                    this.cache.delete(cacheKey);
+                    this.cache.deletePattern(`${context.table}:list:*`);
+                }
                 
                 return result;
+                
             } catch (error) {
-                if (error.message.includes('SQLITE_BUSY') && retryCount < maxRetries - 1) {
-                    retryCount++;
-                    await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
-                } else {
-                    this._emit('error', { table, error: error.message, data });
-                    throw error;
+                lastError = error;
+                
+                // Don't retry certain errors
+                if (error.message.includes('SQLITE_CONSTRAINT') ||
+                    error.message.includes('SQLITE_MISMATCH') ||
+                    error.message.includes('SQLITE_RANGE')) {
+                    break;
                 }
+                
+                // Retry on busy or locked
+                if (error.message.includes('SQLITE_BUSY') || 
+                    error.message.includes('SQLITE_LOCKED')) {
+                    
+                    if (attempt < maxRetries) {
+                        const delay = Math.min(100 * Math.pow(2, attempt - 1), 1000);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                }
+                
+                break;
             }
         }
+
+        this.stats.errors++;
+        this._emit('error', { 
+            sql, 
+            params, 
+            error: lastError.message,
+            context 
+        });
+        
+        throw lastError;
     }
 
     /**
@@ -759,9 +955,14 @@ class SQLiteStores {
         }
 
         const cacheKey = `${table}:${keyValues.join(':')}`;
+        
+        // Check cache
         if (useCache) {
             const cached = this.cache.get(cacheKey);
-            if (cached) return cached;
+            if (cached) {
+                this.stats.cacheHits++;
+                return cached;
+            }
         }
 
         // Build WHERE clause
@@ -782,15 +983,23 @@ class SQLiteStores {
         const softDelete = ['chats', 'contacts', 'msgs', 'groups', 'labels'].includes(table);
         if (softDelete) where.push('deleted = 0');
 
-        const result = await this.db.get(
-            `SELECT * FROM ${table} WHERE ${where.join(' AND ')}`, 
-            params
-        );
+        try {
+            const result = await this.db.get(
+                `SELECT * FROM ${table} WHERE ${where.join(' AND ')}`, 
+                params
+            );
 
-        if (result && useCache) {
-            this.cache.set(cacheKey, result);
+            if (result && useCache) {
+                this.cache.set(cacheKey, result);
+            }
+            
+            return result;
+            
+        } catch (error) {
+            this.stats.errors++;
+            this._emit('error', { table, keyFields, keyValues, error: error.message });
+            throw error;
         }
-        return result;
     }
 
     /**
@@ -807,11 +1016,17 @@ class SQLiteStores {
         const needsSession = !['users', 'global_settings'].includes(table);
 
         const cacheKey = `${table}:list:${whereClause}:${params.join(':')}`;
+        
+        // Check cache
         if (useCache) {
             const cached = this.cache.get(cacheKey);
-            if (cached) return cached;
+            if (cached) {
+                this.stats.cacheHits++;
+                return cached;
+            }
         }
 
+        // Build query
         let where = [];
         let allParams = [];
 
@@ -826,15 +1041,23 @@ class SQLiteStores {
 
         const whereString = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
         
-        const results = await this.db.all(
-            `SELECT * FROM ${table} ${whereString} ${whereClause}`,
-            [...allParams, ...params]
-        );
+        try {
+            const results = await this.db.all(
+                `SELECT * FROM ${table} ${whereString} ${whereClause}`,
+                [...allParams, ...params]
+            );
 
-        if (useCache) {
-            this.cache.set(cacheKey, results);
+            if (useCache) {
+                this.cache.set(cacheKey, results, 60000); // 1 minute TTL for lists
+            }
+            
+            return results;
+            
+        } catch (error) {
+            this.stats.errors++;
+            this._emit('error', { table, whereClause, error: error.message });
+            throw error;
         }
-        return results;
     }
 
     /**
@@ -864,25 +1087,88 @@ class SQLiteStores {
 
         const canSoftDelete = ['chats', 'contacts', 'msgs', 'groups', 'labels'].includes(table);
         
-        let result;
-        if (soft && canSoftDelete) {
-            result = await this.db.run(
-                `UPDATE ${table} SET deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE ${where.join(' AND ')}`,
-                params
-            );
-        } else {
-            result = await this.db.run(
-                `DELETE FROM ${table} WHERE ${where.join(' AND ')}`,
-                params
-            );
+        try {
+            let result;
+            if (soft && canSoftDelete) {
+                result = await this.db.run(
+                    `UPDATE ${table} SET deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE ${where.join(' AND ')}`,
+                    params
+                );
+            } else {
+                result = await this.db.run(
+                    `DELETE FROM ${table} WHERE ${where.join(' AND ')}`,
+                    params
+                );
+            }
+
+            // Clear cache
+            const cacheKey = `${table}:${keyValues.join(':')}`;
+            this.cache.delete(cacheKey);
+            this.cache.deletePattern(`${table}:list:*`);
+
+            return result;
+            
+        } catch (error) {
+            this.stats.errors++;
+            this._emit('error', { table, keyFields, keyValues, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Count records
+     * @param {string} table - Table name
+     * @param {string} whereClause - WHERE clause
+     * @param {Array} params - Query parameters
+     * @returns {Promise<number>} Count
+     */
+    async count(table, whereClause = '', params = []) {
+        if (this.isClosed) throw new Error('Store closed');
+        
+        const needsSession = !['users', 'global_settings'].includes(table);
+        
+        let where = [];
+        let allParams = [];
+
+        if (needsSession) {
+            if (!this.sessionId) throw new Error('sessionId required');
+            where.push('session_id = ?');
+            allParams.push(this.sessionId);
         }
 
-        // Clear cache
-        const cacheKey = `${table}:${keyValues.join(':')}`;
-        this.cache.delete(cacheKey);
-        this.cache.deletePattern(`${table}:list:*`);
+        const softDelete = ['chats', 'contacts', 'msgs', 'groups', 'labels'].includes(table);
+        if (softDelete) where.push('deleted = 0');
 
-        return result;
+        const whereString = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+        
+        try {
+            const result = await this.db.get(
+                `SELECT COUNT(*) as count FROM ${table} ${whereString} ${whereClause}`,
+                [...allParams, ...params]
+            );
+            
+            return result?.count || 0;
+            
+        } catch (error) {
+            this.stats.errors++;
+            throw error;
+        }
+    }
+
+    /**
+     * Check if record exists
+     * @param {string} table - Table name
+     * @param {Array} keyFields - Primary key field names
+     * @param {Array} keyValues - Primary key values
+     * @returns {Promise<boolean>} True if exists
+     */
+    async exists(table, keyFields, keyValues) {
+        try {
+            const result = await this.get(table, keyFields, keyValues, false);
+            return !!result;
+        } catch {
+            return false;
+        }
     }
 
     // ==================== BATCH OPERATIONS ====================
@@ -897,18 +1183,31 @@ class SQLiteStores {
     async batchUpsert(table, items, keys) {
         if (!items.length) return [];
         
-        const tx = await this.beginTx();
-        try {
+        return this.transaction(async () => {
             const results = [];
             for (const item of items) {
                 results.push(await this.upsert(table, item, keys));
             }
-            await tx.commit();
             return results;
-        } catch (error) {
-            await tx.rollback();
-            throw error;
+        });
+    }
+
+    /**
+     * Batch get multiple records
+     * @param {string} table - Table name
+     * @param {Array} keyList - Array of key value arrays
+     * @param {Array} keyFields - Primary key fields
+     * @returns {Promise<Array>} Array of records
+     */
+    async batchGet(table, keyList, keyFields) {
+        if (!keyList.length) return [];
+        
+        const results = [];
+        for (const keys of keyList) {
+            const result = await this.get(table, keyFields, keys);
+            if (result) results.push(result);
         }
+        return results;
     }
 
     // ==================== SPECIAL HANDLERS ====================
@@ -920,29 +1219,31 @@ class SQLiteStores {
      */
     async handleLID(data) {
         if (!data || !data.pn || !data.lid) {
-            throw new Error('Invalid LID data');
+            throw new Error('Invalid LID data: missing pn or lid');
         }
 
-        // Update contact with LID
-        const result = await this.db.run(
-            `UPDATE contacts SET lid = ?, updated_at = CURRENT_TIMESTAMP 
-             WHERE session_id = ? AND (jid = ? OR jid = ?)`,
-            [data.lid, this.sessionId, data.pn, data.lid]
-        );
+        return this.transaction(async () => {
+            // Update contact with LID
+            const result = await this.db.run(
+                `UPDATE contacts SET lid = ?, updated_at = CURRENT_TIMESTAMP 
+                 WHERE session_id = ? AND (jid = ? OR jid = ?)`,
+                [data.lid, this.sessionId, data.pn, data.lid]
+            );
 
-        // If no contact updated, create one
-        if (result.changes === 0) {
-            await this.upsert('contacts', {
-                session_id: this.sessionId,
-                jid: data.pn,
-                lid: data.lid
-            }, ['session_id', 'jid']);
-        }
+            // If no contact updated, create one
+            if (result.changes === 0) {
+                await this.upsert('contacts', {
+                    session_id: this.sessionId,
+                    jid: data.pn,
+                    lid: data.lid
+                }, ['session_id', 'jid']);
+            }
 
-        this.cache.deletePattern('contacts:*');
-        this._emit('lid', { pn: data.pn, lid: data.lid });
-        
-        return result;
+            this.cache.deletePattern('contacts:*');
+            this._emit('lid', { pn: data.pn, lid: data.lid });
+            
+            return result;
+        });
     }
 
     /**
@@ -960,26 +1261,34 @@ class SQLiteStores {
 
         for (const [participant, presenceData] of Object.entries(presences)) {
             try {
+                // Validate presence data
+                const lastKnownPresence = presenceData.lastKnownPresence || 'unavailable';
+                const lastSeen = presenceData.lastSeen ? 
+                    new Date(presenceData.lastSeen * 1000).toISOString() : null;
+                const deviceType = presenceData.deviceType || null;
+
                 const result = await this.upsert('contacts', {
                     session_id: this.sessionId,
                     jid: participant,
-                    presence: presenceData.lastKnownPresence || 'unavailable',
-                    presence_last: presenceData.lastSeen 
-                        ? new Date(presenceData.lastSeen * 1000).toISOString() 
-                        : null,
-                    presence_dev: presenceData.deviceType || null
+                    presence: lastKnownPresence,
+                    presence_last: lastSeen,
+                    presence_dev: deviceType
                 }, ['session_id', 'jid']);
                 
                 results.push(result);
                 
                 this._emit('presence', { 
                     participant, 
-                    presence: presenceData.lastKnownPresence,
-                    lastSeen: presenceData.lastSeen,
+                    presence: lastKnownPresence,
+                    lastSeen,
                     chatJid: id 
                 });
+                
             } catch (error) {
-                this._emit('error', { error: error.message, data: { participant, presenceData } });
+                this._emit('error', { 
+                    error: error.message, 
+                    data: { participant, presenceData } 
+                });
             }
         }
 
@@ -1001,12 +1310,26 @@ class SQLiteStores {
 
         for (const msg of messages) {
             try {
-                if (!msg.key || !msg.key.id) continue;
+                if (!msg.key || !msg.key.id) {
+                    console.warn('[SQLite] Skipping message without ID');
+                    continue;
+                }
 
                 const key = msg.key;
                 const fromMe = key.fromMe ? 1 : 0;
                 const messageId = key.id;
                 const chatJid = key.remoteJid;
+
+                if (!chatJid) {
+                    console.warn('[SQLite] Skipping message without chat JID');
+                    continue;
+                }
+
+                // Extract message content safely
+                const messageType = this._getMsgType(msg.message);
+                const text = this._getText(msg.message);
+                const caption = this._getCaption(msg.message);
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.stanzaId || null;
 
                 // Insert message
                 const msgResult = await this.upsert('msgs', {
@@ -1015,15 +1338,15 @@ class SQLiteStores {
                     chat: chatJid,
                     from_jid: fromMe ? this.sessionId : (key.participant || key.remoteJid),
                     to_jid: fromMe ? key.remoteJid : this.sessionId,
-                    type: this._getMsgType(msg.message),
-                    text: this._getText(msg.message),
-                    caption: this._getCaption(msg.message),
+                    type: messageType,
+                    text: text,
+                    caption: caption,
                     status: this._getStatus(msg),
                     from_me: fromMe,
                     fwd: msg.message?.extendedTextMessage?.isForwarded ? 1 : 0,
                     starred: msg.starred ? 1 : 0,
                     ts: Number(msg.messageTimestamp) || Date.now(),
-                    quoted: msg.message?.extendedTextMessage?.contextInfo?.stanzaId,
+                    quoted: quoted,
                     meta: JSON.stringify({ 
                         type, 
                         pushName: msg.pushName,
@@ -1054,7 +1377,11 @@ class SQLiteStores {
                 });
 
             } catch (error) {
-                this._emit('error', { error: error.message, msgId: msg.key?.id });
+                this._emit('error', { 
+                    error: error.message, 
+                    msgId: msg.key?.id 
+                });
+                this.stats.errors++;
             }
         }
 
@@ -1075,11 +1402,19 @@ class SQLiteStores {
 
         for (const item of data) {
             try {
-                if (!item.key || !item.reaction) continue;
+                if (!item.key || !item.reaction) {
+                    console.warn('[SQLite] Skipping invalid reaction');
+                    continue;
+                }
 
                 const { key, reaction } = item;
                 const messageId = key.id;
                 const reactorJid = key.participant || key.remoteJid;
+
+                if (!messageId || !reactorJid) {
+                    console.warn('[SQLite] Skipping reaction without ID or reactor');
+                    continue;
+                }
 
                 const result = await this.upsert('reactions', {
                     session_id: this.sessionId,
@@ -1121,48 +1456,55 @@ class SQLiteStores {
         const { id: groupJid, author, participants, action } = data;
         const results = [];
 
-        for (const participant of participants) {
-            try {
-                const memberJid = participant.jid || participant;
-                
-                if (action.includes('add') || action.includes('remove')) {
-                    const isActive = !action.includes('remove');
+        return this.transaction(async () => {
+            for (const participant of participants) {
+                try {
+                    const memberJid = participant.jid || participant;
                     
-                    const result = await this.upsert('group_members', {
-                        session_id: this.sessionId,
-                        group_jid: groupJid,
-                        member: memberJid,
-                        lid: participant.lid,
-                        role: 'member',
-                        active: isActive ? 1 : 0,
-                        added_by: action.includes('add') ? author : null,
-                        added_ts: action.includes('add') ? Date.now() : null,
-                        removed_by: action.includes('remove') ? author : null,
-                        removed_ts: action.includes('remove') ? Date.now() : null
-                    }, ['session_id', 'group_jid', 'member']);
+                    if (!memberJid) {
+                        console.warn('[SQLite] Skipping participant without JID');
+                        continue;
+                    }
 
-                    results.push(result);
+                    if (action.includes('add') || action.includes('remove')) {
+                        const isActive = !action.includes('remove');
+                        
+                        const result = await this.upsert('group_members', {
+                            session_id: this.sessionId,
+                            group_jid: groupJid,
+                            member: memberJid,
+                            lid: participant.lid,
+                            role: 'member',
+                            active: isActive ? 1 : 0,
+                            added_by: action.includes('add') ? author : null,
+                            added_ts: action.includes('add') ? Date.now() : null,
+                            removed_by: action.includes('remove') ? author : null,
+                            removed_ts: action.includes('remove') ? Date.now() : null
+                        }, ['session_id', 'group_jid', 'member']);
 
-                } else if (action.includes('promote') || action.includes('demote')) {
-                    const newRole = action.includes('promote') ? 'admin' : 'member';
-                    
-                    const result = await this.db.run(
-                        `UPDATE group_members SET role = ?, updated_at = CURRENT_TIMESTAMP 
-                         WHERE session_id = ? AND group_jid = ? AND member = ?`,
-                        [newRole, this.sessionId, groupJid, memberJid]
-                    );
+                        results.push(result);
 
-                    results.push(result);
+                    } else if (action.includes('promote') || action.includes('demote')) {
+                        const newRole = action.includes('promote') ? 'admin' : 'member';
+                        
+                        const result = await this.db.run(
+                            `UPDATE group_members SET role = ?, updated_at = CURRENT_TIMESTAMP 
+                             WHERE session_id = ? AND group_jid = ? AND member = ?`,
+                            [newRole, this.sessionId, groupJid, memberJid]
+                        );
+
+                        results.push(result);
+                    }
+                } catch (error) {
+                    this._emit('error', { error: error.message, participant });
                 }
-            } catch (error) {
-                this._emit('error', { error: error.message, participant });
             }
-        }
 
-        this.cache.deletePattern('group_members:list:*');
-        this._emit('group', { groupJid, action, participants });
-        
-        return results;
+            this.cache.deletePattern('group_members:list:*');
+            this._emit('group', { groupJid, action, participants });
+            
+            return results;
+        });
     }
 
     // ==================== HELPER METHODS ====================
@@ -1175,12 +1517,15 @@ class SQLiteStores {
      */
     _getMsgType(msg) {
         if (!msg) return 'unknown';
+        
         const types = [
             'conversation', 'imageMessage', 'videoMessage', 'audioMessage', 
             'documentMessage', 'stickerMessage', 'locationMessage', 'contactMessage',
             'contactsArrayMessage', 'liveLocationMessage', 'extendedTextMessage',
-            'protocolMessage', 'reactionMessage', 'pollCreationMessage'
+            'protocolMessage', 'reactionMessage', 'pollCreationMessage',
+            'pollCreationMessageV2', 'pollCreationMessageV3', 'pollUpdateMessage'
         ];
+        
         for (const type of types) {
             if (msg[type]) return type.replace('Message', '').toLowerCase();
         }
@@ -1194,11 +1539,14 @@ class SQLiteStores {
      * @returns {string|null} Text content
      */
     _getText(msg) {
-        if (msg?.conversation) return msg.conversation;
-        if (msg?.extendedTextMessage?.text) return msg.extendedTextMessage.text;
-        if (msg?.imageMessage?.caption) return msg.imageMessage.caption;
-        if (msg?.videoMessage?.caption) return msg.videoMessage.caption;
-        if (msg?.documentMessage?.caption) return msg.documentMessage.caption;
+        if (!msg) return null;
+        
+        if (msg.conversation) return msg.conversation;
+        if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
+        if (msg.imageMessage?.caption) return msg.imageMessage.caption;
+        if (msg.videoMessage?.caption) return msg.videoMessage.caption;
+        if (msg.documentMessage?.caption) return msg.documentMessage.caption;
+        
         return null;
     }
 
@@ -1209,9 +1557,11 @@ class SQLiteStores {
      * @returns {string|null} Caption
      */
     _getCaption(msg) {
-        return msg?.imageMessage?.caption || 
-               msg?.videoMessage?.caption || 
-               msg?.documentMessage?.caption || 
+        if (!msg) return null;
+        
+        return msg.imageMessage?.caption || 
+               msg.videoMessage?.caption || 
+               msg.documentMessage?.caption || 
                null;
     }
 
@@ -1226,6 +1576,7 @@ class SQLiteStores {
         if (msg.status === 3) return 'delivered';
         if (msg.status === 4) return 'read';
         if (msg.status === 1) return 'pending';
+        if (msg.status === 5) return 'played'; // For audio
         return 'unknown';
     }
 
@@ -1243,6 +1594,13 @@ class SQLiteStores {
         if (!username || !pass || !apiKey) {
             throw new Error('Username, password and API key required');
         }
+        
+        // Check if user already exists
+        const exists = await this.exists('users', ['username'], [username]);
+        if (exists) {
+            throw new Error('User already exists');
+        }
+        
         return this.upsert('users', { 
             username, 
             password: pass, 
@@ -1268,7 +1626,13 @@ class SQLiteStores {
      */
     async getUserByApiKey(apiKey) {
         if (!apiKey) return null;
-        return this.db.get(`SELECT * FROM users WHERE api_key = ?`, [apiKey]);
+        
+        try {
+            return await this.db.get(`SELECT * FROM users WHERE api_key = ?`, [apiKey]);
+        } catch (error) {
+            this.stats.errors++;
+            return null;
+        }
     }
 
     /**
@@ -1300,6 +1664,8 @@ class SQLiteStores {
      */
     async deleteUser(username) {
         if (!username) throw new Error('Username required');
+        
+        // This will cascade to user_meta and user_sessions
         return this.db.run(`DELETE FROM users WHERE username = ?`, [username]);
     }
 
@@ -1322,6 +1688,7 @@ class SQLiteStores {
      */
     async setUserMeta(username, key, value) {
         if (!username || !key) throw new Error('Username and key required');
+        
         return this.upsert('user_meta', { 
             username, 
             key, 
@@ -1337,8 +1704,9 @@ class SQLiteStores {
      */
     async getUserMeta(username, key) {
         if (!username || !key) return null;
-        const r = await this.get('user_meta', ['username', 'key'], [username, key], false);
-        return r?.value;
+        
+        const result = await this.get('user_meta', ['username', 'key'], [username, key], false);
+        return result?.value;
     }
 
     /**
@@ -1348,10 +1716,12 @@ class SQLiteStores {
      */
     async getAllUserMeta(username) {
         if (!username) return {};
+        
         const rows = await this.db.all(
             `SELECT key, value FROM user_meta WHERE username = ?`, 
             [username]
         );
+        
         return rows.reduce((acc, row) => { 
             acc[row.key] = row.value; 
             return acc; 
@@ -1366,6 +1736,7 @@ class SQLiteStores {
      */
     async deleteUserMeta(username, key) {
         if (!username || !key) throw new Error('Username and key required');
+        
         return this.db.run(
             `DELETE FROM user_meta WHERE username = ? AND key = ?`, 
             [username, key]
@@ -1382,6 +1753,7 @@ class SQLiteStores {
      */
     async createSession(id, data = {}) {
         if (!id) throw new Error('Session ID required');
+        
         return this.upsert('sessions', { id, ...data }, ['id']);
     }
 
@@ -1420,6 +1792,7 @@ class SQLiteStores {
      */
     async deleteSession(id) {
         if (!id) throw new Error('Session ID required');
+        
         return this.db.run(`DELETE FROM sessions WHERE id = ?`, [id]);
     }
 
@@ -1443,6 +1816,7 @@ class SQLiteStores {
      */
     async setSessionMeta(sessionId, key, value) {
         if (!sessionId || !key) throw new Error('Session ID and key required');
+        
         return this.upsert('session_meta', { 
             session_id: sessionId, 
             key, 
@@ -1458,8 +1832,9 @@ class SQLiteStores {
      */
     async getSessionMeta(sessionId, key) {
         if (!sessionId || !key) return null;
-        const r = await this.get('session_meta', ['session_id', 'key'], [sessionId, key], false);
-        return r?.value;
+        
+        const result = await this.get('session_meta', ['session_id', 'key'], [sessionId, key], false);
+        return result?.value;
     }
 
     /**
@@ -1469,10 +1844,12 @@ class SQLiteStores {
      */
     async getAllSessionMeta(sessionId) {
         if (!sessionId) return {};
+        
         const rows = await this.db.all(
             `SELECT key, value FROM session_meta WHERE session_id = ?`, 
             [sessionId]
         );
+        
         return rows.reduce((acc, row) => { 
             acc[row.key] = row.value; 
             return acc; 
@@ -1487,6 +1864,7 @@ class SQLiteStores {
      */
     async deleteSessionMeta(sessionId, key) {
         if (!sessionId || !key) throw new Error('Session ID and key required');
+        
         return this.db.run(
             `DELETE FROM session_meta WHERE session_id = ? AND key = ?`, 
             [sessionId, key]
@@ -1504,6 +1882,7 @@ class SQLiteStores {
      */
     async setGlobalSetting(key, value, description = '') {
         if (!key) throw new Error('Setting key required');
+        
         return this.upsert('global_settings', { 
             key, 
             value: value !== undefined ? String(value) : null,
@@ -1518,8 +1897,9 @@ class SQLiteStores {
      */
     async getGlobalSetting(key) {
         if (!key) return null;
-        const r = await this.get('global_settings', ['key'], [key], false);
-        return r?.value;
+        
+        const result = await this.get('global_settings', ['key'], [key], false);
+        return result?.value;
     }
 
     /**
@@ -1528,6 +1908,7 @@ class SQLiteStores {
      */
     async getAllGlobalSettings() {
         const rows = await this.db.all(`SELECT * FROM global_settings ORDER BY key`);
+        
         return rows.reduce((acc, row) => {
             acc[row.key] = { 
                 value: row.value, 
@@ -1545,6 +1926,7 @@ class SQLiteStores {
      */
     async deleteGlobalSetting(key) {
         if (!key) throw new Error('Setting key required');
+        
         return this.db.run(`DELETE FROM global_settings WHERE key = ?`, [key]);
     }
 
@@ -1642,10 +2024,27 @@ class SQLiteStores {
     async upsertChat(data) {
         if (!data.jid) throw new Error('Chat JID required');
         
-        const result = await this.upsert('chats', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'jid']);
+        // Ensure required fields
+        const chatData = {
+            session_id: this.sessionId,
+            jid: data.jid,
+            name: data.name || null,
+            pic: data.pic || null,
+            is_group: data.is_group ? 1 : 0,
+            is_broadcast: data.is_broadcast ? 1 : 0,
+            locked: data.locked !== undefined ? data.locked : 0,
+            archived: data.archived !== undefined ? data.archived : 0,
+            pinned: data.pinned !== undefined ? data.pinned : 0,
+            pin_time: data.pin_time || null,
+            mute_until: data.mute_until || null,
+            last_msg_time: data.last_msg_time || null,
+            last_msg_id: data.last_msg_id || null,
+            unread: data.unread || 0,
+            mod_tag: data.mod_tag || null,
+            meta: data.meta || null
+        };
+        
+        const result = await this.upsert('chats', chatData, ['session_id', 'jid']);
         
         this._emit('chat', data);
         return result;
@@ -1753,10 +2152,26 @@ class SQLiteStores {
     async upsertContact(data) {
         if (!data.jid) throw new Error('Contact JID required');
         
-        return this.upsert('contacts', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'jid']);
+        const contactData = {
+            session_id: this.sessionId,
+            jid: data.jid,
+            lid: data.lid || null,
+            phone: data.phone || null,
+            name: data.name || null,
+            short: data.short || null,
+            verified: data.verified || null,
+            push: data.push || null,
+            pic: data.pic || null,
+            status: data.status || null,
+            status_time: data.status_time || null,
+            presence: data.presence || null,
+            presence_last: data.presence_last || null,
+            presence_dev: data.presence_dev || null,
+            blocked: data.blocked || 0,
+            meta: data.meta || null
+        };
+        
+        return this.upsert('contacts', contactData, ['session_id', 'jid']);
     }
 
     /**
@@ -2035,7 +2450,10 @@ class SQLiteStores {
         
         return this.upsert('receipts', {
             session_id: this.sessionId,
-            ...data
+            msg_id: data.msg_id,
+            participant: data.participant,
+            type: data.type,
+            ts: data.ts || Date.now()
         }, ['session_id', 'msg_id', 'participant', 'type']);
     }
 
@@ -2067,7 +2485,21 @@ class SQLiteStores {
         
         return this.upsert('media', {
             session_id: this.sessionId,
-            ...data
+            msg_id: data.msg_id,
+            type: data.type || null,
+            url: data.url || null,
+            key: data.key || null,
+            sha256: data.sha256 || null,
+            enc_sha256: data.enc_sha256 || null,
+            len: data.len || null,
+            h: data.h || null,
+            w: data.w || null,
+            dur: data.dur || null,
+            mime: data.mime || null,
+            fname: data.fname || null,
+            downloaded: data.downloaded || 0,
+            dl_error: data.dl_error || null,
+            meta: data.meta || null
         }, ['session_id', 'msg_id']);
     }
 
@@ -2123,10 +2555,28 @@ class SQLiteStores {
     async upsertGroup(data) {
         if (!data.jid) throw new Error('Group JID required');
         
-        return this.upsert('groups', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'jid']);
+        const groupData = {
+            session_id: this.sessionId,
+            jid: data.jid,
+            subject: data.subject || null,
+            subject_owner: data.subject_owner || null,
+            subject_ts: data.subject_ts || null,
+            desc: data.desc || null,
+            desc_owner: data.desc_owner || null,
+            desc_id: data.desc_id || null,
+            desc_ts: data.desc_ts || null,
+            pic: data.pic || null,
+            pic_id: data.pic_id || null,
+            announce: data.announce ? 1 : 0,
+            restrict: data.restrict ? 1 : 0,
+            locked: data.locked ? 1 : 0,
+            approval: data.approval ? 1 : 0,
+            created_ts: data.created_ts || null,
+            part_ver: data.part_ver || null,
+            meta: data.meta || null
+        };
+        
+        return this.upsert('groups', groupData, ['session_id', 'jid']);
     }
 
     /**
@@ -2221,10 +2671,24 @@ class SQLiteStores {
             throw new Error('Group JID and member required');
         }
         
-        return this.upsert('group_members', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'group_jid', 'member']);
+        const memberData = {
+            session_id: this.sessionId,
+            group_jid: data.group_jid,
+            member: data.member,
+            lid: data.lid || null,
+            role: data.role || 'member',
+            req_status: data.req_status || null,
+            req_method: data.req_method || null,
+            req_ts: data.req_ts || null,
+            label: data.label || null,
+            active: data.active !== undefined ? data.active : 1,
+            added_by: data.added_by || null,
+            added_ts: data.added_ts || null,
+            removed_by: data.removed_by || null,
+            removed_ts: data.removed_ts || null
+        };
+        
+        return this.upsert('group_members', memberData, ['session_id', 'group_jid', 'member']);
     }
 
     /**
@@ -2256,10 +2720,21 @@ class SQLiteStores {
     async upsertCall(data) {
         if (!data.id) throw new Error('Call ID required');
         
-        return this.upsert('calls', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'id']);
+        const callData = {
+            session_id: this.sessionId,
+            id: data.id,
+            from_jid: data.from_jid || null,
+            to_jid: data.to_jid || null,
+            type: data.type || null,
+            status: data.status || null,
+            ts: data.ts || Date.now(),
+            dur: data.dur || null,
+            video: data.video ? 1 : 0,
+            group_jid: data.group_jid || null,
+            meta: data.meta || null
+        };
+        
+        return this.upsert('calls', callData, ['session_id', 'id']);
     }
 
     /**
@@ -2302,7 +2777,7 @@ class SQLiteStores {
         if (!id) throw new Error('Call ID required');
         
         const updates = { status };
-        if (duration !== null) updates.duration = duration;
+        if (duration !== null) updates.dur = duration;
         
         const call = await this.get('calls', ['session_id', 'id'], [this.sessionId, id]);
         if (!call) return null;
@@ -2325,10 +2800,18 @@ class SQLiteStores {
     async upsertLabel(data) {
         if (!data.id || !data.name) throw new Error('Label ID and name required');
         
-        return this.upsert('labels', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'id']);
+        const labelData = {
+            session_id: this.sessionId,
+            id: data.id,
+            name: data.name,
+            color: data.color || '#888888',
+            predefined_id: data.predefined_id || null,
+            count: data.count || 0,
+            meta: data.meta || null,
+            deleted: data.deleted || 0
+        };
+        
+        return this.upsert('labels', labelData, ['session_id', 'id']);
     }
 
     /**
@@ -2472,10 +2955,21 @@ class SQLiteStores {
     async upsertNewsletter(data) {
         if (!data.id) throw new Error('Newsletter ID required');
         
-        return this.upsert('newsletters', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'id']);
+        const newsletterData = {
+            session_id: this.sessionId,
+            id: data.id,
+            server_id: data.server_id || null,
+            name: data.name || null,
+            description: data.description || null,
+            picture: data.picture || null,
+            subscribers: data.subscribers || 0,
+            created_ts: data.created_ts || null,
+            verified: data.verified ? 1 : 0,
+            following: data.following ? 1 : 0,
+            meta: data.meta || null
+        };
+        
+        return this.upsert('newsletters', newsletterData, ['session_id', 'id']);
     }
 
     /**
@@ -2504,10 +2998,23 @@ class SQLiteStores {
     async upsertNewsletterPost(data) {
         if (!data.nid || !data.pid) throw new Error('Newsletter ID and post ID required');
         
-        return this.upsert('newsletter_posts', { 
-            session_id: this.sessionId, 
-            ...data 
-        }, ['session_id', 'nid', 'pid']);
+        const postData = {
+            session_id: this.sessionId,
+            nid: data.nid,
+            pid: data.pid,
+            server_id: data.server_id || null,
+            msg_id: data.msg_id || null,
+            title: data.title || null,
+            content: data.content || null,
+            media_type: data.media_type || null,
+            media_url: data.media_url || null,
+            views: data.views || 0,
+            reactions: data.reactions || 0,
+            posted_ts: data.posted_ts || Date.now(),
+            meta: data.meta || null
+        };
+        
+        return this.upsert('newsletter_posts', postData, ['session_id', 'nid', 'pid']);
     }
 
     /**
@@ -2543,7 +3050,7 @@ class SQLiteStores {
         );
     }
 
-    // ==================== WEBHOOK METHODS (for n8n) ====================
+    // ==================== WEBHOOK METHODS ====================
 
     /**
      * Create webhook for n8n
@@ -2557,6 +3064,12 @@ class SQLiteStores {
         
         const id = `webhook_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
         
+        // Check if webhook for this event already exists
+        const existing = await this.getWebhookByEvent(data.event);
+        if (existing) {
+            throw new Error(`Webhook for event ${data.event} already exists`);
+        }
+        
         return this.upsert('webhooks', {
             id,
             session_id: this.sessionId,
@@ -2566,7 +3079,7 @@ class SQLiteStores {
             enabled: data.enabled !== undefined ? data.enabled : 1,
             retry_count: data.retry_count || 3,
             timeout: data.timeout || 10000,
-            secret: data.secret
+            secret: data.secret || null
         }, ['id']);
     }
 
@@ -2956,24 +3469,6 @@ class SQLiteStores {
         }
     }
 
-    // ==================== TRANSACTIONS ====================
-
-    /**
-     * Begin database transaction
-     * @returns {Promise<Object>} Transaction object with commit/rollback
-     */
-    async beginTx() {
-        await this.db.exec('BEGIN IMMEDIATE');
-        return {
-            commit: async () => {
-                await this.db.exec('COMMIT');
-            },
-            rollback: async () => {
-                await this.db.exec('ROLLBACK');
-            }
-        };
-    }
-
     // ==================== UTILITY METHODS ====================
 
     /**
@@ -2994,8 +3489,12 @@ class SQLiteStores {
      * @returns {Promise<void>}
      */
     async optimize() {
-        await this.db.exec('PRAGMA optimize');
-        await this.db.exec('ANALYZE');
+        try {
+            await this.db.exec('PRAGMA optimize');
+            await this.db.exec('ANALYZE');
+        } catch (error) {
+            console.warn('[SQLite] Optimize failed:', error.message);
+        }
     }
 
     /**
@@ -3003,7 +3502,11 @@ class SQLiteStores {
      * @returns {Promise<void>}
      */
     async vacuum() {
-        await this.db.exec('VACUUM');
+        try {
+            await this.db.exec('VACUUM');
+        } catch (error) {
+            console.warn('[SQLite] Vacuum failed:', error.message);
+        }
     }
 
     /**
@@ -3028,6 +3531,19 @@ class SQLiteStores {
     }
 
     /**
+     * Check if database is corrupted
+     * @returns {Promise<boolean>} True if healthy
+     */
+    async integrityCheck() {
+        try {
+            const result = await this.db.get('PRAGMA integrity_check');
+            return result && result.integrity_check === 'ok';
+        } catch {
+            return false;
+        }
+    }
+
+    /**
      * Close database connection
      * @returns {Promise<void>}
      */
@@ -3041,6 +3557,14 @@ class SQLiteStores {
         Object.keys(this.cbs).forEach(k => {
             this.cbs[k] = [];
         });
+        
+        // Close prepared statements
+        for (const stmt of this.preparedStmts.values()) {
+            try {
+                await stmt.finalize();
+            } catch (e) {}
+        }
+        this.preparedStmts.clear();
         
         if (this.db) {
             await this.db.close();
@@ -3056,11 +3580,12 @@ class SQLiteStores {
      */
     stats() {
         return {
-            cacheSize: this.cache.cache.size,
+            ...this.stats,
+            cache: this.cache.getStats(),
             listeners: Object.fromEntries(
                 Object.entries(this.cbs).map(([k, v]) => [k, v.length])
             ),
-            uptime: process.uptime()
+            uptime: Date.now() - this.stats.startTime
         };
     }
 
@@ -3072,10 +3597,14 @@ class SQLiteStores {
         try {
             await this.db.get('SELECT 1');
             const size = await this.getDbSize();
+            const integrity = await this.integrityCheck();
+            
             return {
-                status: 'healthy',
+                status: integrity ? 'healthy' : 'degraded',
                 dbSize: size,
                 sessionId: this.sessionId,
+                integrity: integrity ? 'ok' : 'failed',
+                stats: this.stats,
                 timestamp: new Date().toISOString()
             };
         } catch (error) {

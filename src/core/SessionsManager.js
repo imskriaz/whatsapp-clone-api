@@ -2,6 +2,8 @@
 const SessionHandler = require('./SessionHandler');
 const SQLiteStores = require('./SQLiteStores');
 const { v4: uuidv4 } = require('uuid');
+const logger = require('../utils/logger');
+const { sleep, retry, formatDuration } = require('../utils/helpers');
 
 class SessionsManager {
     /**
@@ -21,14 +23,19 @@ class SessionsManager {
         this.maxPerUser = options.maxPerUser || 5;
         this.maxTotal = options.maxTotal || 100;
         this.sessionTimeout = options.sessionTimeout || 30 * 60 * 1000; // 30 mins
-        this.store = null;
         this.cleanupInterval = null;
+        this.restoreInProgress = false;
+        this.isShuttingDown = false;
         this.stats = {
             created: 0,
             closed: 0,
             errors: 0,
+            restored: 0,
             startTime: Date.now()
         };
+        this.limits = new Map(); // User-specific limits cache
+        this.limitsCacheTime = 0;
+        this.store = null;
     }
 
     // ==================== INIT ====================
@@ -38,17 +45,38 @@ class SessionsManager {
      * @returns {Promise<this>}
      */
     async init() {
-        // Initialize global store
-        this.store = new SQLiteStores(null, this.dbPath);
-        await this.store.init();
+        logger.info('Initializing sessions manager');
 
-        // Restore active sessions
-        await this._restoreSessions();
+        try {
+            // Initialize global store with retry
+            const store = new SQLiteStores(null, this.dbPath);
+            await retry(() => store.init(), {
+                maxAttempts: 3,
+                onRetry: ({ attempt }) => logger.debug(`Store init retry ${attempt}`)
+            });
+            this.store = store;
 
-        // Start cleanup interval
-        this._startCleanup();
+            // Restore active sessions
+            await this._restoreSessions();
 
-        return this;
+            // Load user limits from DB
+            await this._refreshLimits();
+
+            // Start cleanup interval
+            this._startCleanup();
+
+            logger.info('Sessions manager initialized', {
+                sessions: this.sessions.size,
+                users: this.userSessions.size,
+                limits: { maxPerUser: this.maxPerUser, maxTotal: this.maxTotal }
+            });
+
+            return this;
+
+        } catch (error) {
+            logger.error('Failed to initialize sessions manager', error);
+            throw error;
+        }
     }
 
     /**
@@ -56,20 +84,62 @@ class SessionsManager {
      * @private
      */
     async _restoreSessions() {
+        if (this.restoreInProgress) return;
+        this.restoreInProgress = true;
+
+        logger.info('Restoring active sessions...');
+
         try {
             const sessions = await this.store.all('sessions', 'WHERE logged_in = 1');
-            
+            let restored = 0;
+            let failed = 0;
+
             for (const s of sessions) {
-                const user = await this.store.getSessionUser(s.id);
-                if (user) {
-                    await this._add(s.id, user.username, true);
-                    this.stats.created++;
+                try {
+                    const user = await this.store.getSessionUser(s.id);
+                    if (user) {
+                        await this._add(s.id, user.username, true);
+                        restored++;
+                        this.stats.restored++;
+                    }
+                } catch (err) {
+                    failed++;
+                    logger.error(`Failed to restore session ${s.id}`, { error: err.message });
+
+                    // Mark as logged out in DB
+                    await this.store.updateSession(s.id, { logged_in: 0 }).catch(() => { });
                 }
             }
 
-            console.log(`[Manager] Restored ${this.sessions.size} sessions`);
-        } catch (err) {
-            console.error('[Manager] Restore failed:', err.message);
+            logger.info(`Restored ${restored} sessions, ${failed} failed`);
+
+        } catch (error) {
+            logger.error('Restore failed', error);
+        } finally {
+            this.restoreInProgress = false;
+        }
+    }
+
+    /**
+     * Refresh user limits from database
+     * @private
+     */
+    async _refreshLimits() {
+        try {
+            const users = await this.store.getAllUsers();
+            this.limits.clear();
+
+            for (const user of users) {
+                const meta = await this.store.getAllUserMeta(user.username);
+                const sessionLimit = meta.session_limit ? parseInt(meta.session_limit) : this.maxPerUser;
+                this.limits.set(user.username, sessionLimit);
+            }
+
+            this.limitsCacheTime = Date.now();
+            logger.debug(`Refreshed limits for ${users.length} users`);
+
+        } catch (error) {
+            logger.error('Failed to refresh limits', error);
         }
     }
 
@@ -78,12 +148,16 @@ class SessionsManager {
      * @private
      */
     _startCleanup() {
+        const interval = 5 * 60 * 1000; // 5 minutes
+
         this.cleanupInterval = setInterval(() => {
             this._cleanupInactive().catch(err => {
-                console.error('[Manager] Cleanup error:', err.message);
+                logger.error('Cleanup error', err);
                 this.stats.errors++;
             });
-        }, 5 * 60 * 1000); // Every 5 minutes
+        }, interval);
+
+        logger.debug(`Cleanup scheduled every ${formatDuration(interval)}`);
     }
 
     /**
@@ -91,24 +165,47 @@ class SessionsManager {
      * @private
      */
     async _cleanupInactive() {
+        if (this.isShuttingDown) return;
+
         const now = Date.now();
         let cleaned = 0;
+        const errors = [];
 
         for (const [sid, sess] of this.sessions) {
-            const dbSession = await this.store.getSession(sid).catch(() => null);
-            if (!dbSession) continue;
+            try {
+                const dbSession = await this.store.getSession(sid).catch(() => null);
+                if (!dbSession) {
+                    // Orphaned session, remove
+                    await this._remove(sid, 'orphaned');
+                    cleaned++;
+                    continue;
+                }
 
-            const lastSeen = dbSession.last_seen ? new Date(dbSession.last_seen).getTime() : 0;
-            
-            // Remove if inactive for too long and not connected
-            if (now - lastSeen > this.sessionTimeout && sess.state !== 'open') {
-                await this.remove(sid, 'timeout');
-                cleaned++;
+                const lastSeen = dbSession.last_seen ? new Date(dbSession.last_seen).getTime() : 0;
+                const inactive = now - lastSeen;
+
+                // Remove if inactive for too long and not connected
+                if (inactive > this.sessionTimeout && sess.state !== 'open') {
+                    await this._remove(sid, 'timeout');
+                    cleaned++;
+                }
+
+            } catch (err) {
+                errors.push({ sid, error: err.message });
             }
         }
 
         if (cleaned > 0) {
-            console.log(`[Manager] Cleaned ${cleaned} inactive sessions`);
+            logger.info(`Cleaned ${cleaned} inactive sessions`);
+        }
+
+        if (errors.length > 0) {
+            logger.warn(`Cleanup errors: ${errors.length}`, { errors });
+        }
+
+        // Refresh limits every hour
+        if (now - this.limitsCacheTime > 3600000) {
+            await this._refreshLimits();
         }
     }
 
@@ -121,11 +218,18 @@ class SessionsManager {
      * @returns {Promise<SessionHandler>}
      */
     async _add(sid, uid, restored = false) {
+        // Check if already exists
+        if (this.sessions.has(sid)) {
+            throw new Error(`Session ${sid} already exists`);
+        }
+
+        // Create session
         const sess = new SessionHandler(sid, uid, this.wss);
         await sess.init(this.dbPath);
-        
+
+        // Store in memory
         this.sessions.set(sid, sess);
-        
+
         const userSet = this.userSessions.get(uid) || new Set();
         userSet.add(sid);
         this.userSessions.set(uid, userSet);
@@ -134,7 +238,41 @@ class SessionsManager {
             this.stats.created++;
         }
 
+        logger.debug('Session added', { sid, uid, restored });
+
         return sess;
+    }
+
+    /**
+     * Remove session from memory
+     * @private
+     * @param {string} sid - Session ID
+     * @param {string} reason - Removal reason
+     */
+    async _remove(sid, reason) {
+        const sess = this.sessions.get(sid);
+        if (!sess) return;
+
+        const uid = sess.uid;
+
+        try {
+            await sess.close();
+        } catch (err) {
+            logger.error(`Error closing session ${sid}`, err);
+        }
+
+        this.sessions.delete(sid);
+
+        const userSet = this.userSessions.get(uid);
+        if (userSet) {
+            userSet.delete(sid);
+            if (userSet.size === 0) {
+                this.userSessions.delete(uid);
+            }
+        }
+
+        this.stats.closed++;
+        logger.debug('Session removed', { sid, uid, reason });
     }
 
     // ==================== CORE METHODS ====================
@@ -143,43 +281,75 @@ class SessionsManager {
      * Create new session
      * @param {string} uid - User ID
      * @param {Object} options - Session options
-     * @param {string} options.platform - Platform name
-     * @param {string} options.device - Device identifier
-     * @param {string} options.sid - Custom session ID (optional)
      * @returns {Promise<Object>} Session info
      */
     async create(uid, options = {}) {
-        // Check limits
-        const userCount = this.userSessions.get(uid)?.size || 0;
-        if (userCount >= this.maxPerUser) {
-            throw new Error(`Max sessions (${this.maxPerUser}) reached for user`);
+        const context = { uid, options };
+
+        try {
+            // Check if user exists
+            const user = await this.store.getUserByUsername(uid);
+            if (!user) {
+                throw new Error(`User ${uid} not found`);
+            }
+
+            // Get user's session limit
+            const userLimit = this.limits.get(uid) || this.maxPerUser;
+            const userCount = this.userSessions.get(uid)?.size || 0;
+
+            // Check per-user limit
+            if (userCount >= userLimit) {
+                throw new Error(`Max sessions (${userLimit}) reached for user`);
+            }
+
+            // Check total limit
+            if (this.sessions.size >= this.maxTotal) {
+                throw new Error('Max total sessions reached');
+            }
+
+            const sid = options.sid || uuidv4();
+
+            // Check if session ID already exists
+            if (this.sessions.has(sid)) {
+                throw new Error(`Session ID ${sid} already exists`);
+            }
+
+            // Save to DB with retry
+            await retry(() =>
+                this.store.createSession(sid, {
+                    device_id: options.device || `device-${Date.now()}`,
+                    platform: options.platform || 'web',
+                    status: 'initializing'
+                }), {
+                maxAttempts: 3
+            });
+
+            await this.store.assignUserSession(uid, sid);
+
+            // Create session
+            const sess = await this._add(sid, uid);
+
+            // Log activity
+            await this.store.logActivity({
+                user_id: uid,
+                action: 'create_session',
+                resource: sid,
+                details: { platform: options.platform, device: options.device }
+            }).catch(() => { });
+
+            logger.info('Session created', { sid, uid, platform: options.platform });
+
+            return {
+                sid,
+                qr: sess.qr,
+                state: sess.state
+            };
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Failed to create session', { ...context, error: error.message });
+            throw error;
         }
-
-        if (this.sessions.size >= this.maxTotal) {
-            throw new Error('Max total sessions reached');
-        }
-
-        const sid = options.sid || uuidv4();
-
-        // Save to DB
-        await this.store.createSession(sid, {
-            device_id: options.device || `device-${Date.now()}`,
-            platform: options.platform || 'web',
-            status: 'initializing'
-        });
-
-        await this.store.assignUserSession(uid, sid);
-
-        // Create session
-        const sess = await this._add(sid, uid);
-
-        console.log(`[Manager] Session created: ${sid} for user ${uid}`);
-
-        return {
-            sid,
-            qr: sess.qr,
-            state: sess.state
-        };
     }
 
     /**
@@ -190,24 +360,47 @@ class SessionsManager {
      * @returns {Promise<SessionHandler>}
      */
     async createWithAuth(uid, authData, options = {}) {
-        const sid = options.sid || uuidv4();
+        const context = { uid, options };
 
-        await this.store.createSession(sid, {
-            device_id: authData.deviceId,
-            phone: authData.phoneNumber,
-            platform: options.platform || 'web',
-            status: 'authenticated',
-            creds: JSON.stringify(authData.creds),
-            logged_in: 1
-        });
+        try {
+            // Check user limits
+            const userLimit = this.limits.get(uid) || this.maxPerUser;
+            const userCount = this.userSessions.get(uid)?.size || 0;
 
-        await this.store.assignUserSession(uid, sid);
+            if (userCount >= userLimit) {
+                throw new Error(`Max sessions (${userLimit}) reached for user`);
+            }
 
-        const sess = await this._add(sid, uid);
-        
-        console.log(`[Manager] Auth session created: ${sid}`);
+            if (this.sessions.size >= this.maxTotal) {
+                throw new Error('Max total sessions reached');
+            }
 
-        return sess;
+            const sid = options.sid || uuidv4();
+
+            // Save to DB
+            await this.store.createSession(sid, {
+                device_id: authData.deviceId,
+                phone: authData.phoneNumber,
+                platform: options.platform || 'web',
+                status: 'authenticated',
+                creds: JSON.stringify(authData.creds),
+                logged_in: 1
+            });
+
+            await this.store.assignUserSession(uid, sid);
+
+            // Create session
+            const sess = await this._add(sid, uid);
+
+            logger.info('Auth session created', { sid, uid });
+
+            return sess;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Failed to create auth session', { ...context, error: error.message });
+            throw error;
+        }
     }
 
     /**
@@ -228,21 +421,29 @@ class SessionsManager {
         const sess = this.sessions.get(sid);
         if (!sess) return null;
 
-        const dbSession = await this.store.getSession(sid);
-        const user = await this.store.getSessionUser(sid);
+        try {
+            const dbSession = await this.store.getSession(sid);
+            const user = await this.store.getSessionUser(sid);
+            const info = await sess.getInfo();
 
-        return {
-            sid,
-            uid: user?.username,
-            state: sess.state,
-            connected: sess.state === 'open',
-            phone: dbSession?.phone,
-            platform: dbSession?.platform,
-            device: dbSession?.device_id,
-            created: dbSession?.created_at,
-            lastSeen: dbSession?.last_seen,
-            stats: await sess.getInfo().catch(() => ({}))
-        };
+            return {
+                sid,
+                uid: user?.username,
+                state: sess.state,
+                connected: sess.state === 'open',
+                phone: dbSession?.phone,
+                platform: dbSession?.platform,
+                device: dbSession?.device_id,
+                created: dbSession?.created_at,
+                lastSeen: dbSession?.last_seen,
+                stats: info.stats,
+                meta: await this.store.getAllSessionMeta(sid)
+            };
+
+        } catch (error) {
+            logger.error('Failed to get session info', { sid, error: error.message });
+            return null;
+        }
     }
 
     /**
@@ -273,7 +474,8 @@ class SessionsManager {
                 sid,
                 uid: sess.uid,
                 state: sess.state,
-                connected: sess.state === 'open'
+                connected: sess.state === 'open',
+                uptime: Date.now() - sess.startTime
             });
         }
         return result;
@@ -286,33 +488,39 @@ class SessionsManager {
      * @returns {Promise<boolean>}
      */
     async remove(sid, reason = 'manual') {
-        const sess = this.sessions.get(sid);
-        if (!sess) return false;
-
-        const uid = sess.uid;
+        const context = { sid, reason };
 
         try {
-            await sess.close();
-        } catch (err) {
-            console.error(`[Manager] Error closing session ${sid}:`, err.message);
-        }
-
-        this.sessions.delete(sid);
-
-        const userSet = this.userSessions.get(uid);
-        if (userSet) {
-            userSet.delete(sid);
-            if (userSet.size === 0) {
-                this.userSessions.delete(uid);
+            const sess = this.sessions.get(sid);
+            if (!sess) {
+                logger.debug('Session not found for removal', context);
+                return false;
             }
+
+            const uid = sess.uid;
+
+            await this._remove(sid, reason);
+
+            // Update DB
+            await this.store.deactivateUserSession(uid, sid).catch(() => { });
+
+            // Log activity
+            await this.store.logActivity({
+                user_id: uid,
+                session_id: sid,
+                action: 'remove_session',
+                details: { reason }
+            }).catch(() => { });
+
+            logger.info('Session removed', { sid, uid, reason });
+
+            return true;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Failed to remove session', { ...context, error: error.message });
+            return false;
         }
-
-        await this.store.deactivateUserSession(uid, sid).catch(() => {});
-
-        this.stats.closed++;
-        console.log(`[Manager] Session removed: ${sid} (${reason})`);
-
-        return true;
     }
 
     /**
@@ -326,12 +534,98 @@ class SessionsManager {
         if (!sids) return 0;
 
         let count = 0;
+        const errors = [];
+
         for (const sid of [...sids]) {
-            await this.remove(sid, reason);
-            count++;
+            try {
+                await this.remove(sid, reason);
+                count++;
+            } catch (err) {
+                errors.push({ sid, error: err.message });
+            }
+        }
+
+        if (errors.length > 0) {
+            logger.warn(`Removed ${count}/${sids.size} sessions for user ${uid}`, { errors });
+        } else {
+            logger.info(`Removed all ${count} sessions for user ${uid}`);
         }
 
         return count;
+    }
+
+    /**
+     * Update session
+     * @param {string} sid - Session ID
+     * @param {Object} updates - Updates
+     * @returns {Promise<Object>} Updated session
+     */
+    async updateSession(sid, updates) {
+        const sess = this.sessions.get(sid);
+        if (!sess) throw new Error(`Session ${sid} not found`);
+
+        return this.store.updateSession(sid, updates);
+    }
+
+    // ==================== VALIDATION ====================
+
+    /**
+     * Check if user can create session
+     * @param {string} uid - User ID
+     * @returns {Promise<Object>} { allowed, reason, current, limit }
+     */
+    async canCreateSession(uid) {
+        const userLimit = this.limits.get(uid) || this.maxPerUser;
+        const userCount = this.userSessions.get(uid)?.size || 0;
+
+        if (userCount >= userLimit) {
+            return {
+                allowed: false,
+                reason: 'user_limit',
+                current: userCount,
+                limit: userLimit
+            };
+        }
+
+        if (this.sessions.size >= this.maxTotal) {
+            return {
+                allowed: false,
+                reason: 'total_limit',
+                current: this.sessions.size,
+                limit: this.maxTotal
+            };
+        }
+
+        return { allowed: true };
+    }
+
+    /**
+     * Check if session belongs to user
+     * @param {string} sid - Session ID
+     * @param {string} uid - User ID
+     * @returns {boolean}
+     */
+    isOwner(sid, uid) {
+        const sess = this.sessions.get(sid);
+        return sess ? sess.uid === uid : false;
+    }
+
+    /**
+     * Check if session exists
+     * @param {string} sid - Session ID
+     * @returns {boolean}
+     */
+    has(sid) {
+        return this.sessions.has(sid);
+    }
+
+    /**
+     * Get session count for user
+     * @param {string} uid - User ID
+     * @returns {number}
+     */
+    countForUser(uid) {
+        return this.userSessions.get(uid)?.size || 0;
     }
 
     // ==================== ACTION PROXIES ====================
@@ -419,6 +713,76 @@ class SessionsManager {
     }
 
     /**
+     * Archive chat
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {boolean} archive - True to archive
+     */
+    async archiveChat(sid, jid, archive = true) {
+        return this.exec(sid, 'archiveChat', jid, archive);
+    }
+
+    /**
+     * Pin chat
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {boolean} pin - True to pin
+     */
+    async pinChat(sid, jid, pin = true) {
+        return this.exec(sid, 'pinChat', jid, pin);
+    }
+
+    /**
+     * Mute chat
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {number} muteUntil - Timestamp to unmute
+     */
+    async muteChat(sid, jid, muteUntil = null) {
+        return this.exec(sid, 'muteChat', jid, muteUntil);
+    }
+
+    /**
+     * Mark chat read
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {boolean} read - True to mark read
+     */
+    async markChatRead(sid, jid, read = true) {
+        return this.exec(sid, 'markChatRead', jid, read);
+    }
+
+    /**
+     * Delete chat
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     */
+    async deleteChat(sid, jid) {
+        return this.exec(sid, 'deleteChat', jid);
+    }
+
+    /**
+     * Delete message
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {string} msgId - Message ID
+     */
+    async deleteMessage(sid, jid, msgId) {
+        return this.exec(sid, 'deleteMessage', jid, msgId);
+    }
+
+    /**
+     * Star message
+     * @param {string} sid - Session ID
+     * @param {string} jid - Chat JID
+     * @param {string} msgId - Message ID
+     * @param {boolean} star - True to star
+     */
+    async starMessage(sid, jid, msgId, star = true) {
+        return this.exec(sid, 'starMessage', jid, msgId, star);
+    }
+
+    /**
      * Profile action
      * @param {string} sid - Session ID
      * @param {string} cmd - Command
@@ -459,6 +823,17 @@ class SessionsManager {
      */
     async getWebhooks(sid) {
         return this.exec(sid, 'getWebhooks');
+    }
+
+    /**
+     * Update webhook
+     * @param {string} sid - Session ID
+     * @param {string} id - Webhook ID
+     * @param {Object} updates - Updates
+     * @returns {Promise<Object>}
+     */
+    async updateWebhook(sid, id, updates) {
+        return this.exec(sid, 'updateWebhook', id, updates);
     }
 
     /**
@@ -528,10 +903,12 @@ class SessionsManager {
      * @param {string} jid - Chat JID
      * @param {number} limit - Limit
      * @param {number} offset - Offset
+     * @param {number} before - Before timestamp
+     * @param {number} after - After timestamp
      * @returns {Promise<Array>}
      */
-    async getMessages(sid, jid, limit = 50, offset = 0) {
-        return this.exec(sid, 'getMessages', jid, limit, offset);
+    async getMessages(sid, jid, limit = 50, offset = 0, before = null, after = null) {
+        return this.exec(sid, 'getMessages', jid, limit, offset, before, after);
     }
 
     /**
@@ -681,15 +1058,6 @@ class SessionsManager {
         return this.exec(sid, 'getSetting', name);
     }
 
-    /**
-     * Get session info
-     * @param {string} sid - Session ID
-     * @returns {Promise<Object>}
-     */
-    async getInfo(sid) {
-        return this.exec(sid, 'getInfo');
-    }
-
     // ==================== SESSION CONTROL ====================
 
     /**
@@ -701,11 +1069,10 @@ class SessionsManager {
         if (!sess) throw new Error(`Session ${sid} not found`);
 
         await sess.logout();
-        await this.store.deactivateUserSession(sess.uid, sid).catch(() => {});
 
         // Remove from memory after logout
         setTimeout(() => {
-            this.remove(sid, 'logged_out').catch(() => {});
+            this.remove(sid, 'logged_out').catch(() => { });
         }, 1000);
     }
 
@@ -718,6 +1085,29 @@ class SessionsManager {
         return this.removeAllForUser(uid, 'admin_kill');
     }
 
+    /**
+     * Broadcast to all sessions
+     * @param {string} event - Event name
+     * @param {*} data - Event data
+     */
+    broadcast(event, data) {
+        const msg = JSON.stringify({ event, data });
+        let sent = 0;
+
+        for (const sess of this.sessions.values()) {
+            if (sess.wss) {
+                sess.wss.clients.forEach(c => {
+                    if (c.readyState === WebSocket.OPEN && c.sessionId === sess.sid) {
+                        c.send(msg);
+                        sent++;
+                    }
+                });
+            }
+        }
+
+        logger.debug(`Broadcast ${event} to ${sent} clients`);
+    }
+
     // ==================== UTILITY ====================
 
     /**
@@ -725,53 +1115,68 @@ class SessionsManager {
      * @returns {Object}
      */
     getStats() {
+        const sessionsByState = {};
+        for (const sess of this.sessions.values()) {
+            sessionsByState[sess.state] = (sessionsByState[sess.state] || 0) + 1;
+        }
+
         return {
             ...this.stats,
             activeSessions: this.sessions.size,
             activeUsers: this.userSessions.size,
-            uptime: Date.now() - this.stats.startTime,
+            sessionsByState,
             limits: {
                 maxPerUser: this.maxPerUser,
                 maxTotal: this.maxTotal,
                 sessionTimeout: this.sessionTimeout
-            }
+            },
+            uptime: Date.now() - this.stats.startTime,
+            memory: process.memoryUsage()
         };
     }
 
     /**
-     * Check if session exists
-     * @param {string} sid - Session ID
-     * @returns {boolean}
+     * Get user limits
+     * @param {string} uid - User ID
+     * @returns {Object} User limits
      */
-    has(sid) {
-        return this.sessions.has(sid);
+    getUserLimits(uid) {
+        return {
+            sessionLimit: this.limits.get(uid) || this.maxPerUser,
+            currentSessions: this.userSessions.get(uid)?.size || 0
+        };
     }
 
     /**
-     * Get session count for user
-     * @param {string} uid - User ID
-     * @returns {number}
+     * Refresh user limits
      */
-    countForUser(uid) {
-        return this.userSessions.get(uid)?.size || 0;
+    async refreshUserLimits() {
+        await this._refreshLimits();
     }
 
     /**
      * Close all sessions
      */
     async closeAll() {
-        console.log('[Manager] Closing all sessions...');
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
 
+        logger.info('Closing all sessions...');
+
+        // Stop cleanup interval
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
             this.cleanupInterval = null;
         }
 
+        // Close all sessions
         const closePromises = [];
+        const errors = [];
+
         for (const [sid, sess] of this.sessions) {
             closePromises.push(
                 sess.close().catch(err => {
-                    console.error(`[Manager] Error closing ${sid}:`, err.message);
+                    errors.push({ sid, error: err.message });
                 })
             );
         }
@@ -780,13 +1185,19 @@ class SessionsManager {
 
         this.sessions.clear();
         this.userSessions.clear();
+        this.limits.clear();
 
+        // Close global store
         if (this.store) {
-            await this.store.close().catch(() => {});
+            await this.store.close().catch(() => { });
             this.store = null;
         }
 
-        console.log('[Manager] All sessions closed');
+        if (errors.length > 0) {
+            logger.warn(`Closed with ${errors.length} errors`, { errors });
+        }
+
+        logger.info('All sessions closed');
     }
 
     /**
@@ -794,14 +1205,24 @@ class SessionsManager {
      * @returns {Promise<Object>}
      */
     async healthCheck() {
-        const storeOk = this.store ? await this.store.healthCheck().catch(() => false) : false;
+        try {
+            const storeOk = this.store ? await this.store.healthCheck().catch(() => false) : false;
+            const dbSize = this.store ? await this.store.getDbSize().catch(() => 0) : 0;
 
-        return {
-            status: storeOk ? 'healthy' : 'degraded',
-            stats: this.getStats(),
-            store: storeOk ? 'ok' : 'error',
-            timestamp: new Date().toISOString()
-        };
+            return {
+                status: storeOk ? 'healthy' : 'degraded',
+                stats: this.getStats(),
+                store: storeOk ? 'ok' : 'error',
+                dbSize,
+                timestamp: new Date().toISOString()
+            };
+        } catch (error) {
+            return {
+                status: 'unhealthy',
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
     }
 }
 
