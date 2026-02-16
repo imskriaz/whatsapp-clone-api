@@ -33,7 +33,7 @@ Complete WhatsApp Web API Clone with Multi-Session Support, Role-Based Access Co
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/whatsapp-clone-api.git
+git clone https://github.com/imskriaz/whatsapp-clone-api.git
 cd whatsapp-clone-api
 
 # Install dependencies
