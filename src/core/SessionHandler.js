@@ -59,7 +59,6 @@ class SessionHandler {
         try {
             logger.info('Initializing session', context);
 
-            // Initialize database with retry
             this.db = new SQLiteStores(this.sid, dbPath);
             await retry(() => this.db.init(), {
                 maxAttempts: 3,
@@ -68,7 +67,6 @@ class SessionHandler {
 
             this._setupCallbacks();
 
-            // Load session from DB
             const session = await this.db.getSession(this.sid);
             if (!session) {
                 await this.db.createSession(this.sid, {
@@ -78,10 +76,7 @@ class SessionHandler {
                 });
             }
 
-            // Load webhooks into cache
             await this._refreshWebhookCache();
-
-            // Connect WhatsApp socket
             await this._connect(session?.creds);
 
             logger.info('Session initialized', { ...context, state: this.state });
@@ -129,6 +124,7 @@ class SessionHandler {
             for (const w of webhooks) {
                 if (w.enabled) {
                     this.webhookCache.set(w.event, {
+                        id: w.id,
                         url: w.url,
                         headers: w.headers ? JSON.parse(w.headers) : {},
                         retry_count: w.retry_count,
@@ -185,11 +181,11 @@ class SessionHandler {
                 defaultQueryTimeoutMs: 10000,
                 keepAliveIntervalMs: 30000,
                 logger: {
-                    level: 'fatal', // Suppress Baileys logs
-                    info: () => { },
+                    level: 'fatal',
+                    info: () => {},
                     error: (msg) => logger.debug('Baileys error', { sid: this.sid, msg }),
-                    warn: () => { },
-                    debug: () => { }
+                    warn: () => {},
+                    debug: () => {}
                 }
             });
 
@@ -403,15 +399,13 @@ class SessionHandler {
 
             if (connection === 'open') {
                 this.reconn = 0;
-                await this.db.updateSession(this.sid, { logged_in: 1 }).catch(() => { });
+                await this.db.updateSession(this.sid, { logged_in: 1 }).catch(() => {});
                 this._emit('connected', {});
                 logger.info('WhatsApp connected', context);
-
-                // Process any queued messages
                 await this._processMessageQueue();
 
             } else if (connection === 'close') {
-                await this.db.updateSession(this.sid, { logged_in: 0 }).catch(() => { });
+                await this.db.updateSession(this.sid, { logged_in: 0 }).catch(() => {});
 
                 const code = lastDisconnect?.error?.output?.statusCode;
                 const errorMsg = lastDisconnect?.error?.message || 'Unknown error';
@@ -1090,10 +1084,8 @@ class SessionHandler {
 
             this._emit('history_progress', { progress, type: syncType });
 
-            // Process in batches to avoid memory issues
             const batchSize = 100;
 
-            // Process chats
             if (chats && Array.isArray(chats)) {
                 for (let i = 0; i < chats.length; i += batchSize) {
                     const batch = chats.slice(i, i + batchSize);
@@ -1110,7 +1102,6 @@ class SessionHandler {
                 }
             }
 
-            // Process contacts
             if (contacts && Array.isArray(contacts)) {
                 for (let i = 0; i < contacts.length; i += batchSize) {
                     const batch = contacts.slice(i, i + batchSize);
@@ -1124,7 +1115,6 @@ class SessionHandler {
                 }
             }
 
-            // Process LID mappings
             if (lidPnMappings && Array.isArray(lidPnMappings)) {
                 for (const m of lidPnMappings) {
                     await this.db.handleLID(m).catch(err =>
@@ -1156,7 +1146,6 @@ class SessionHandler {
      * @param {Object} data - Event data
      */
     async _sendToWebhook(event, data) {
-        // Refresh cache every 5 minutes
         if (Date.now() - this.webhookCacheTime > 300000) {
             await this._refreshWebhookCache();
         }
@@ -1174,20 +1163,18 @@ class SessionHandler {
             data
         };
 
-        // Queue webhook delivery
-        setImmediate(() => this._deliverWebhook(event, webhook, payload));
+        setImmediate(() => this._deliverWebhook(webhook, payload));
     }
 
     /**
      * Deliver webhook with retry
      * @private
-     * @param {string} event - Event type
      * @param {Object} webhook - Webhook config
      * @param {Object} payload - Payload to send
      */
-    async _deliverWebhook(event, webhook, payload) {
+    async _deliverWebhook(webhook, payload) {
         const start = Date.now();
-        const context = { sid: this.sid, event, url: webhook.url };
+        const context = { sid: this.sid, event: payload.event, url: webhook.url };
 
         try {
             await retry(
@@ -1208,20 +1195,15 @@ class SessionHandler {
                     const success = response.status >= 200 && response.status < 300;
                     const duration = Date.now() - start;
 
-                    // Find webhook ID from DB (needed for logging)
-                    const dbWebhook = await this.db.getWebhookByEvent(event).catch(() => null);
+                    await this.db.logWebhookDelivery(webhook.id, payload.event, {
+                        payload,
+                        response_status: response.status,
+                        response_body: response.data,
+                        success,
+                        duration
+                    }).catch(() => {});
 
-                    if (dbWebhook) {
-                        await this.db.logWebhookDelivery(dbWebhook.id, event, {
-                            payload,
-                            response_status: response.status,
-                            response_body: response.data,
-                            success,
-                            duration
-                        }).catch(() => { });
-
-                        await this.db.updateWebhookStats(dbWebhook.id, success, response.status).catch(() => { });
-                    }
+                    await this.db.updateWebhookStats(webhook.id, success, response.status).catch(() => {});
 
                     if (success) {
                         logger.debug('Webhook delivered', { ...context, status: response.status, duration });
@@ -1242,16 +1224,12 @@ class SessionHandler {
         } catch (err) {
             logger.error('Webhook delivery failed permanently', { ...context, error: err.message });
 
-            // Log final failure
-            const dbWebhook = await this.db.getWebhookByEvent(event).catch(() => null);
-            if (dbWebhook) {
-                await this.db.logWebhookDelivery(dbWebhook.id, event, {
-                    payload,
-                    success: false,
-                    duration: Date.now() - start,
-                    error: err.message
-                }).catch(() => { });
-            }
+            await this.db.logWebhookDelivery(webhook.id, payload.event, {
+                payload,
+                success: false,
+                duration: Date.now() - start,
+                error: err.message
+            }).catch(() => {});
         }
     }
 
@@ -1284,16 +1262,13 @@ class SessionHandler {
 
         try {
             while (this.messageQueue.length > 0) {
-                // Check connection state
                 if (this.state !== 'open') {
-                    // Wait for reconnection
                     await new Promise(r => setTimeout(r, 1000));
                     continue;
                 }
 
                 const item = this.messageQueue.shift();
 
-                // Check if message is too old (5 minutes)
                 if (Date.now() - item.queuedAt > 300000) {
                     item.reject(new Error('Message timeout'));
                     continue;
@@ -1306,7 +1281,6 @@ class SessionHandler {
                     item.reject(err);
                 }
 
-                // Small delay between messages
                 await sleep(100);
             }
         } finally {
@@ -1327,17 +1301,11 @@ class SessionHandler {
         if (!this.sock) throw new Error('Socket not connected');
         if (!jid) throw new Error('JID required');
         if (!content) throw new Error('Content required');
-
-        // Validate JID
-        if (!isValidJid(jid)) {
-            throw new Error('Invalid JID format');
-        }
+        if (!isValidJid(jid)) throw new Error('Invalid JID format');
 
         this.lastActivity = Date.now();
 
-        // Build message based on type
         let message;
-
         switch (type) {
             case MESSAGE_TYPES.TEXT:
                 if (typeof content !== 'string') throw new Error('Text content must be string');
@@ -1346,18 +1314,12 @@ class SessionHandler {
 
             case MESSAGE_TYPES.IMAGE:
                 if (!content.buffer) throw new Error('Image buffer required');
-                message = {
-                    image: content.buffer,
-                    caption: content.caption || ''
-                };
+                message = { image: content.buffer, caption: content.caption || '' };
                 break;
 
             case MESSAGE_TYPES.VIDEO:
                 if (!content.buffer) throw new Error('Video buffer required');
-                message = {
-                    video: content.buffer,
-                    caption: content.caption || ''
-                };
+                message = { video: content.buffer, caption: content.caption || '' };
                 break;
 
             case MESSAGE_TYPES.AUDIO:
@@ -1411,7 +1373,6 @@ class SessionHandler {
                 throw new Error(`Unsupported message type: ${type}`);
         }
 
-        // Queue or send directly
         return new Promise((resolve, reject) => {
             this._queueMessage(jid, message, resolve, reject);
         }).then(async (sent) => {
@@ -1423,7 +1384,7 @@ class SessionHandler {
                 action: 'send_message',
                 resource: jid,
                 details: { type, id: sent?.key?.id }
-            }).catch(() => { });
+            }).catch(() => {});
 
             return sent;
         });
@@ -1457,8 +1418,9 @@ class SessionHandler {
                 action: 'send_reaction',
                 resource: msgId,
                 details: { jid, emoji }
-            }).catch(() => { });
+            }).catch(() => {});
 
+            this._emit('reaction', { jid, msgId, emoji });
             return result;
 
         } catch (error) {
@@ -1481,6 +1443,12 @@ class SessionHandler {
 
         try {
             await this.sock.readMessages([{ remoteJid: jid, id: msgId }]);
+            
+            // Update message status in DB
+            await this.db.updateMsgStatus(msgId, 'read');
+            
+            this._emit('read', { jid, msgId });
+            
         } catch (error) {
             logger.error('Failed to mark as read', { sid: this.sid, error: error.message });
             throw error;
@@ -1505,14 +1473,243 @@ class SessionHandler {
 
         try {
             await this.sock.sendPresenceUpdate(state, jid);
-
+            
+            // Update contact presence in DB
             await this.db.upsertContact({
                 jid,
                 presence: state,
                 presence_last: new Date().toISOString()
-            }).catch(err => logger.error('Failed to update presence in DB', err));            
+            }).catch(err => logger.error('Failed to update presence in DB', err));
+            
+            this._emit('presence', { jid, state });
+            
         } catch (error) {
+            this.stats.errors++;
             logger.error('Failed to update presence', { sid: this.sid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Archive/unarchive chat
+     * @param {string} jid - Chat JID
+     * @param {boolean} archive - True to archive
+     * @returns {Promise<Object>}
+     */
+    async archiveChat(jid, archive = true) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid) throw new Error('JID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { archive: archive },
+                jid
+            );
+
+            await this.db.upsertChat({
+                jid,
+                archived: archive ? 1 : 0
+            });
+
+            this._emit('chat_update', { jid, action: 'archive', value: archive });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Archive chat failed', { sid: this.sid, jid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Pin/unpin chat
+     * @param {string} jid - Chat JID
+     * @param {boolean} pin - True to pin
+     * @returns {Promise<Object>}
+     */
+    async pinChat(jid, pin = true) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid) throw new Error('JID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { pin: pin ? 1 : -1 },
+                jid
+            );
+
+            await this.db.upsertChat({
+                jid,
+                pinned: pin ? 1 : 0,
+                pin_time: pin ? Date.now() : null
+            });
+
+            this._emit('chat_update', { jid, action: 'pin', value: pin });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Pin chat failed', { sid: this.sid, jid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Mute/unmute chat
+     * @param {string} jid - Chat JID
+     * @param {number} muteUntil - Timestamp to unmute (null to unmute)
+     * @returns {Promise<Object>}
+     */
+    async muteChat(jid, muteUntil = null) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid) throw new Error('JID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { mute: muteUntil || -1 },
+                jid
+            );
+
+            await this.db.upsertChat({
+                jid,
+                mute_until: muteUntil
+            });
+
+            this._emit('chat_update', { jid, action: 'mute', value: muteUntil });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Mute chat failed', { sid: this.sid, jid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Mark chat as read/unread
+     * @param {string} jid - Chat JID
+     * @param {boolean} read - True to mark as read
+     * @returns {Promise<Object>}
+     */
+    async markChatRead(jid, read = true) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid) throw new Error('JID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { markRead: read },
+                jid
+            );
+
+            await this.db.upsertChat({
+                jid,
+                unread: read ? 0 : 1
+            });
+
+            this._emit('chat_update', { jid, action: 'read', value: read });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Mark chat read failed', { sid: this.sid, jid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Delete chat
+     * @param {string} jid - Chat JID
+     * @returns {Promise<Object>}
+     */
+    async deleteChat(jid) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid) throw new Error('JID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { delete: true },
+                jid
+            );
+
+            await this.db.deleteChat(jid);
+            this._emit('chat_delete', { jid });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Delete chat failed', { sid: this.sid, jid, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Delete message for everyone
+     * @param {string} jid - Chat JID
+     * @param {string} msgId - Message ID
+     * @returns {Promise<Object>}
+     */
+    async deleteMessage(jid, msgId) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid || !msgId) throw new Error('JID and message ID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.sendMessage(jid, {
+                delete: {
+                    remoteJid: jid,
+                    fromMe: true,
+                    id: msgId,
+                    participant: jid
+                }
+            });
+
+            await this.db.deleteMsg(msgId);
+            this._emit('message_delete', { jid, msgId });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Delete message failed', { sid: this.sid, jid, msgId, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * Star/unstar message
+     * @param {string} jid - Chat JID
+     * @param {string} msgId - Message ID
+     * @param {boolean} star - True to star
+     * @returns {Promise<Object>}
+     */
+    async starMessage(jid, msgId, star = true) {
+        if (!this.sock) throw new Error('Socket not connected');
+        if (!jid || !msgId) throw new Error('JID and message ID required');
+
+        this.lastActivity = Date.now();
+
+        try {
+            const result = await this.sock.chatModify(
+                { star: { messages: [{ id: msgId, fromMe: true }], star: star } },
+                jid
+            );
+
+            await this.db.starMsg(msgId, star);
+            this._emit('message_update', { msgId, starred: star });
+            return result;
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Star message failed', { sid: this.sid, jid, msgId, error: error.message });
             throw error;
         }
     }
@@ -1545,18 +1742,39 @@ class SessionHandler {
                 case 'create':
                     if (!jid) throw new Error('Group subject required');
                     result = await this.sock.groupCreate(jid, data);
+                    
+                    // Store new group in DB
+                    if (result?.id) {
+                        await this.db.upsertGroup({
+                            jid: result.id,
+                            subject: jid,
+                            created_ts: Date.now()
+                        });
+                        
+                        // Add creator as admin
+                        await this.db.upsertGroupMember({
+                            group_jid: result.id,
+                            member: this.sid,
+                            role: 'admin',
+                            active: true
+                        });
+                    }
                     break;
 
                 case 'subject':
                     if (!jid) throw new Error('Group JID required');
                     if (!data[0]) throw new Error('Subject required');
                     result = await this.sock.groupUpdateSubject(jid, data[0]);
+                    
+                    await this.db.upsertGroup({ jid, subject: data[0] });
                     break;
 
                 case 'desc':
                     if (!jid) throw new Error('Group JID required');
                     if (!data[0]) throw new Error('Description required');
                     result = await this.sock.groupUpdateDescription(jid, data[0]);
+                    
+                    await this.db.upsertGroup({ jid, desc: data[0] });
                     break;
 
                 case 'add':
@@ -1566,6 +1784,30 @@ class SessionHandler {
                     if (!jid) throw new Error('Group JID required');
                     if (!data || !data.length) throw new Error('Participants required');
                     result = await this.sock.groupParticipantsUpdate(jid, data, cmd);
+                    
+                    // Update group members in DB
+                    for (const participant of data) {
+                        if (cmd === 'add') {
+                            await this.db.upsertGroupMember({
+                                group_jid: jid,
+                                member: participant,
+                                role: 'member',
+                                active: true,
+                                added_ts: Date.now()
+                            });
+                        } else if (cmd === 'remove') {
+                            await this.db.upsertGroupMember({
+                                group_jid: jid,
+                                member: participant,
+                                active: false,
+                                removed_ts: Date.now()
+                            });
+                        } else if (cmd === 'promote') {
+                            await this.db.updateGroupMemberRole(jid, participant, 'admin');
+                        } else if (cmd === 'demote') {
+                            await this.db.updateGroupMemberRole(jid, participant, 'member');
+                        }
+                    }
                     break;
 
                 case 'announce':
@@ -1576,44 +1818,84 @@ class SessionHandler {
                     const setting = cmd === 'lock' ? 'locked' :
                         cmd === 'unlock' ? 'unlocked' : cmd;
                     result = await this.sock.groupSettingUpdate(jid, setting);
+                    
+                    await this.db.upsertGroup({
+                        jid,
+                        announce: cmd === 'announce' ? 1 : (cmd === 'not_announce' ? 0 : undefined),
+                        locked: cmd === 'lock' ? 1 : (cmd === 'unlock' ? 0 : undefined)
+                    });
                     break;
 
                 case 'invite':
                     if (!jid) throw new Error('Group JID required');
                     const code = await this.sock.groupInviteCode(jid);
+                    
+                    // Store invite code in group metadata
+                    const group = await this.db.getGroup(jid);
+                    const meta = group?.meta ? JSON.parse(group.meta) : {};
+                    meta.inviteCode = code;
+                    meta.inviteGenerated = Date.now();
+                    
                     await this.db.upsertGroup({
                         jid,
-                        meta: JSON.stringify({
-                            ...(await this.db.getGroup(jid)).meta ? JSON.parse(await this.db.getGroup(jid).meta) : {},
-                            inviteCode: code,
-                            inviteGenerated: Date.now()
-                        })
-                    }).catch(err => logger.error('Failed to store invite code', err));    
-                    result = { code };                
+                        meta: JSON.stringify(meta)
+                    });
+                    
+                    result = { code };
                     break;
 
                 case 'revoke':
                     if (!jid) throw new Error('Group JID required');
                     const newCode = await this.sock.groupRevokeInvite(jid);
+                    
+                    // Update group with new invite code
+                    const existingGroup = await this.db.getGroup(jid);
+                    const existingMeta = existingGroup?.meta ? JSON.parse(existingGroup.meta) : {};
+                    existingMeta.inviteCode = newCode;
+                    existingMeta.inviteRevoked = Date.now();
+                    
                     await this.db.upsertGroup({
                         jid,
-                        meta: JSON.stringify({
-                            ...(await this.db.getGroup(jid)).meta ? JSON.parse(await this.db.getGroup(jid).meta) : {},
-                            inviteCode: newCode,
-                            inviteRevoked: Date.now()
-                        })
-                    }).catch(err => logger.error('Failed to update invite code', err));                    
+                        meta: JSON.stringify(existingMeta)
+                    });
+                    
                     result = { code: newCode };
                     break;
 
                 case 'join':
                     if (!data[0]) throw new Error('Invite code required');
                     result = await this.sock.groupAcceptInvite(data[0]);
+                    
+                    // Store joined group in DB
+                    if (result?.id) {
+                        await this.db.upsertGroup({
+                            jid: result.id,
+                            subject: 'Joined Group',
+                            created_ts: Date.now()
+                        });
+                        
+                        // Add self as member
+                        await this.db.upsertGroupMember({
+                            group_jid: result.id,
+                            member: this.sid,
+                            role: 'member',
+                            active: true,
+                            added_ts: Date.now()
+                        });
+                    }
                     break;
 
                 case 'leave':
                     if (!jid) throw new Error('Group JID required');
                     result = await this.sock.groupLeave(jid);
+                    
+                    // Mark as left in DB
+                    await this.db.upsertGroupMember({
+                        group_jid: jid,
+                        member: this.sid,
+                        active: false,
+                        removed_ts: Date.now()
+                    });
                     break;
             }
 
@@ -1623,8 +1905,9 @@ class SessionHandler {
                 action: `group_${cmd}`,
                 resource: jid || 'group',
                 details: { cmd, data }
-            }).catch(() => { });
+            }).catch(() => {});
 
+            this._emit('group', { cmd, jid, data, result });
             return result;
 
         } catch (error) {
@@ -1654,7 +1937,9 @@ class SessionHandler {
                 session_id: this.sid,
                 action: block ? 'block' : 'unblock',
                 resource: jid
-            }).catch(() => { });
+            }).catch(() => {});
+
+            this._emit('blocklist_update', { jid, action: block ? 'block' : 'unblock' });
 
         } catch (error) {
             this.stats.errors++;
@@ -1683,6 +1968,7 @@ class SessionHandler {
 
             switch (cmd) {
                 case 'name':
+                    if (!data) throw new Error('Name required');
                     result = await this.sock.updateProfileName(data);
                     
                     // Store in session meta
@@ -1690,6 +1976,7 @@ class SessionHandler {
                     break;
 
                 case 'status':
+                    if (!data) throw new Error('Status required');
                     result = await this.sock.updateProfileStatus(data);
                     
                     // Store in session meta
@@ -1697,6 +1984,7 @@ class SessionHandler {
                     break;
 
                 case 'pic':
+                    if (!data) throw new Error('Picture buffer required');
                     result = await this.sock.updateProfilePicture(jid || this.sid, data);
                     
                     // Store in session meta or contact
@@ -1704,6 +1992,16 @@ class SessionHandler {
                         await this.db.upsertContact({ jid, pic: 'updated' });
                     } else {
                         await this.db.setSessionMeta(this.sid, 'profile_pic', 'updated');
+                    }
+                    break;
+
+                case 'pic_rm':
+                    result = await this.sock.removeProfilePicture(jid || this.sid);
+                    
+                    if (jid && jid !== this.sid) {
+                        await this.db.upsertContact({ jid, pic: null });
+                    } else {
+                        await this.db.setSessionMeta(this.sid, 'profile_pic', null);
                     }
                     break;
 
@@ -1720,8 +2018,9 @@ class SessionHandler {
                 action: `profile_${cmd}`,
                 resource: jid,
                 details: { cmd }
-            }).catch(() => { });
+            }).catch(() => {});
 
+            this._emit('profile', { cmd, jid, result });
             return result;
 
         } catch (error) {
@@ -1753,16 +2052,29 @@ class SessionHandler {
                 case 'create':
                     if (!data?.name) throw new Error('Newsletter name required');
                     result = await this.sock.newsletterCreate(data.name, data.desc || '');
+                    
+                    if (result?.id) {
+                        await this.db.upsertNewsletter({
+                            id: result.id,
+                            name: data.name,
+                            description: data.desc || '',
+                            following: true
+                        });
+                    }
                     break;
 
                 case 'follow':
                     if (!id) throw new Error('Newsletter ID required');
                     result = await this.sock.newsletterFollow(id);
+                    
+                    await this.db.upsertNewsletter({ id, following: true });
                     break;
 
                 case 'unfollow':
                     if (!id) throw new Error('Newsletter ID required');
                     result = await this.sock.newsletterUnfollow(id);
+                    
+                    await this.db.upsertNewsletter({ id, following: false });
                     break;
 
                 case 'send':
@@ -1778,8 +2090,9 @@ class SessionHandler {
                 action: `newsletter_${cmd}`,
                 resource: id,
                 details: { cmd, data }
-            }).catch(() => { });
+            }).catch(() => {});
 
+            this._emit('newsletter', { cmd, id, result });
             return result;
 
         } catch (error) {
@@ -1885,233 +2198,6 @@ class SessionHandler {
                 responseTime: Date.now() - start,
                 statusCode: error.response?.status
             };
-        }
-    }
-
-    /**
-     * Archive/unarchive chat
-     * @param {string} jid - Chat JID
-     * @param {boolean} archive - True to archive
-     * @returns {Promise<Object>}
-     */
-    async archiveChat(jid, archive = true) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid) throw new Error('JID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send archive command to WhatsApp
-            const result = await this.sock.chatModify(
-                { archive: archive },
-                jid
-            );
-
-            // Update local DB
-            await this.db.upsertChat({
-                jid,
-                archived: archive ? 1 : 0
-            });
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Archive chat failed', { sid: this.sid, jid, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Pin/unpin chat
-     * @param {string} jid - Chat JID
-     * @param {boolean} pin - True to pin
-     * @returns {Promise<Object>}
-     */
-    async pinChat(jid, pin = true) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid) throw new Error('JID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send pin command to WhatsApp
-            const result = await this.sock.chatModify(
-                { pin: pin ? 1 : -1 },
-                jid
-            );
-
-            // Update local DB
-            await this.db.upsertChat({
-                jid,
-                pinned: pin ? 1 : 0,
-                pin_time: pin ? Date.now() : null
-            });
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Pin chat failed', { sid: this.sid, jid, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Mute/unmute chat
-     * @param {string} jid - Chat JID
-     * @param {number} muteUntil - Timestamp to unmute (null to unmute)
-     * @returns {Promise<Object>}
-     */
-    async muteChat(jid, muteUntil = null) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid) throw new Error('JID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send mute command to WhatsApp
-            const result = await this.sock.chatModify(
-                { mute: muteUntil || -1 },
-                jid
-            );
-
-            // Update local DB
-            await this.db.upsertChat({
-                jid,
-                mute_until: muteUntil
-            });
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Mute chat failed', { sid: this.sid, jid, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Mark chat as read/unread
-     * @param {string} jid - Chat JID
-     * @param {boolean} read - True to mark as read
-     * @returns {Promise<Object>}
-     */
-    async markChatRead(jid, read = true) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid) throw new Error('JID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send mark read command to WhatsApp
-            const result = await this.sock.chatModify(
-                { markRead: read },
-                jid
-            );
-
-            // Update local DB
-            await this.db.upsertChat({
-                jid,
-                unread: read ? 0 : 1
-            });
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Mark chat read failed', { sid: this.sid, jid, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Delete chat
-     * @param {string} jid - Chat JID
-     * @returns {Promise<Object>}
-     */
-    async deleteChat(jid) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid) throw new Error('JID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send delete chat command to WhatsApp
-            const result = await this.sock.chatModify(
-                { delete: true },
-                jid
-            );
-
-            // Delete from local DB (soft delete)
-            await this.db.deleteChat(jid);
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Delete chat failed', { sid: this.sid, jid, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Delete message for everyone
-     * @param {string} jid - Chat JID
-     * @param {string} msgId - Message ID
-     * @returns {Promise<Object>}
-     */
-    async deleteMessage(jid, msgId) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid || !msgId) throw new Error('JID and message ID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send delete message command to WhatsApp
-            const result = await this.sock.sendMessage(jid, {
-                delete: {
-                    remoteJid: jid,
-                    fromMe: true,
-                    id: msgId,
-                    participant: jid
-                }
-            });
-
-            // Delete from local DB (soft delete)
-            await this.db.deleteMsg(msgId);
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Delete message failed', { sid: this.sid, jid, msgId, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Star/unstar message
-     * @param {string} jid - Chat JID
-     * @param {string} msgId - Message ID
-     * @param {boolean} star - True to star
-     * @returns {Promise<Object>}
-     */
-    async starMessage(jid, msgId, star = true) {
-        if (!this.sock) throw new Error('Socket not connected');
-        if (!jid || !msgId) throw new Error('JID and message ID required');
-
-        this.lastActivity = Date.now();
-
-        try {
-            // Send star command to WhatsApp
-            const result = await this.sock.chatModify(
-                { star: { messages: [{ id: msgId, fromMe: true }], star: star } },
-                jid
-            );
-
-            // Update local DB
-            await this.db.starMsg(msgId, star);
-
-            return result;
-        } catch (error) {
-            this.stats.errors++;
-            logger.error('Star message failed', { sid: this.sid, jid, msgId, error: error.message });
-            throw error;
         }
     }
 
@@ -2356,7 +2442,6 @@ class SessionHandler {
 
         this.wss.clients.forEach(c => {
             if (c.readyState === WebSocket.OPEN && c.sessionId === this.sid) {
-                // Check if client is subscribed to this event
                 if (!c.subscriptions || c.subscriptions.has(event) || c.subscriptions.has('all')) {
                     c.send(msg);
                     sent++;
@@ -2420,7 +2505,7 @@ class SessionHandler {
             await this.db.updateSession(this.sid, {
                 status: 'logged_out',
                 logged_in: 0
-            }).catch(() => { });
+            }).catch(() => {});
 
             this._emit('logged_out', {});
             logger.info('Logged out', { sid: this.sid });
@@ -2439,19 +2524,16 @@ class SessionHandler {
     async close() {
         logger.info('Closing session', { sid: this.sid });
 
-        // Clear message queue
         this.messageQueue.forEach(item => {
             item.reject(new Error('Session closed'));
         });
         this.messageQueue = [];
 
-        // Clear pending promises
         for (const [id, { reject }] of this.pendingPromises) {
             reject(new Error('Session closed'));
         }
         this.pendingPromises.clear();
 
-        // Close socket
         if (this.sock) {
             try {
                 this.sock.ev.removeAllListeners();
@@ -2462,16 +2544,13 @@ class SessionHandler {
             }
         }
 
-        // Unsubscribe callbacks
         this.unsub.forEach(fn => {
             try { fn(); } catch (err) { }
         });
         this.unsub = [];
 
-        // Clear cache
         this.webhookCache.clear();
 
-        // Close database
         if (this.db) {
             await this.db.close().catch(() => { });
             this.db = null;
