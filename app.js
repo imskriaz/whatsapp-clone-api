@@ -425,13 +425,16 @@ class App {
         logger.info('✅ Middleware setup complete');
     }
 
-    /**
-     * Setup routes
-     */
     setupRoutes() {
         logger.info('🛣️ Setting up routes...');
 
-        // Health check
+        // ⚠️ IMPORTANT: Static files MUST come first
+        this.app.use('/css', express.static(path.join(__dirname, 'public/css')));
+        this.app.use('/js', express.static(path.join(__dirname, 'public/js')));
+        this.app.use('/views', express.static(path.join(__dirname, 'public/views')));
+        this.app.use('/public', express.static(path.join(__dirname, 'public')));
+
+        // Health check - only ONCE
         this.app.get('/health', (req, res) => {
             res.json({
                 status: 'ok',
@@ -443,54 +446,24 @@ class App {
             });
         });
 
-        // API routes (mounted at /api)
-        this.app.use('/api', routes(this.manager, this.store));
-
-        // Web routes (mounted at root)
-        // Serve static files - IMPORTANT: These must come BEFORE the 404 handler
-        this.app.use('/css', express.static(path.join(__dirname, 'public/css')));
-        this.app.use('/js', express.static(path.join(__dirname, 'public/js')));
-        this.app.use('/views', express.static(path.join(__dirname, 'public/views')));
-        this.app.use('/public', express.static(path.join(__dirname, 'public')));
-
         // Web routes (UI)
         const webRoutes = require('./src/web/routes');
         this.app.use('/', webRoutes);
 
-        // 404 handler for API routes (non-web)
+        // API routes
+        this.app.use('/api', routes(this.manager, this.store));
+
+        // 404 handler for API routes
         this.app.use('/api/*', (req, res) => {
             res.status(404).json({ error: 'API route not found' });
         });
 
-        // 404 handler for web routes
-        this.app.use((req, res) => {
-            // Check if it's an API request
-            if (req.path.startsWith('/api/')) {
-                return res.status(404).json({ error: 'API route not found' });
-            }
-            // Serve web 404 page
-            res.status(404).sendFile(path.join(__dirname, 'public/views/pages/404.html'));
+        // SPA catch-all - THIS IS CRITICAL
+        // Any route not matched above will serve index.html
+        this.app.get('*', (req, res) => {
+            res.sendFile(path.join(__dirname, 'public/index.html'));
         });
 
-        // 404 handler - MUST be last
-        this.app.use((req, res) => {
-            // Check if headers already sent
-            if (res.headersSent) {
-                return;
-            }
-            
-            // Try to serve 404.html
-            const filePath = path.join(__dirname, 'public/views/pages/404.html');
-            if (fs.existsSync(filePath)) {
-                res.status(404).sendFile(filePath);
-            } else {
-                res.status(404).json({ 
-                    error: 'Route not found',
-                    code: 'NOT_FOUND',
-                    path: req.url 
-                });
-            }
-        });
         // Error handler
         this.app.use(errorHandler);
 

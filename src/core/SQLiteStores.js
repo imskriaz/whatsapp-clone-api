@@ -227,6 +227,7 @@ class SQLiteStores {
                 password TEXT NOT NULL,
                 api_key TEXT UNIQUE NOT NULL,
                 role TEXT DEFAULT 'user',
+                active BOOLEAN DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -681,6 +682,18 @@ class SQLiteStores {
         }
 
         await this.createIndexes();
+        const userCount = await this.db.get(`SELECT COUNT(*) as count FROM users`);
+        if (userCount.count === 0) {
+            const defaultApiKey = crypto.randomBytes(32).toString('hex');
+            await this.db.run(`
+                INSERT INTO users (username, password, api_key, role, active) 
+                VALUES (?, ?, ?, ?, ?)
+            `, ['admin', '123', defaultApiKey, 'superadmin', 1]);
+            console.log('[SQLite] ✅ Default admin user created (username: admin, password: 123)');
+            console.log('[SQLite] 📝 API Key:', defaultApiKey);
+        } else {
+            console.log('[SQLite] 👥 Existing users found, skipping admin creation');
+        }
     }
 
     /**
