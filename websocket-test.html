@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test Client</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #fff; }
+        #messages { height: 400px; overflow-y: auto; border: 1px solid #333; padding: 10px; margin-bottom: 10px; background: #2d2d2d; }
+        .sent { color: #4caf50; }
+        .received { color: #2196f3; }
+        .error { color: #f44336; }
+        input, button { padding: 8px; margin: 5px; background: #333; color: #fff; border: 1px solid #555; }
+        button { cursor: pointer; background: #4caf50; border: none; }
+        button:hover { background: #45a049; }
+        .status { padding: 5px; margin: 5px 0; background: #333; }
+        .connected { color: #4caf50; }
+        .disconnected { color: #f44336; }
+    </style>
+</head>
+<body>
+    <h2>🔌 WebSocket Test Client</h2>
+    
+    <div class="status" id="status">Status: Disconnected</div>
+    
+    <div>
+        <input type="text" id="serverUrl" value="ws://localhost:3000" placeholder="Server URL" style="width: 200px;">
+        <input type="text" id="sessionId" placeholder="Session ID" value="test-session">
+        <input type="text" id="apiKey" placeholder="API Key" value="your-api-key">
+        <button onclick="connect()">Connect</button>
+        <button onclick="disconnect()">Disconnect</button>
+    </div>
+    
+    <div id="messages"></div>
+    
+    <div>
+        <select id="messageType">
+            <option value="ping">Ping</option>
+            <option value="send_message">Send Message</option>
+            <option value="send_reaction">Send Reaction</option>
+            <option value="mark_read">Mark Read</option>
+            <option value="set_presence">Set Presence</option>
+            <option value="get_chats">Get Chats</option>
+            <option value="get_messages">Get Messages</option>
+            <option value="get_contacts">Get Contacts</option>
+            <option value="subscribe">Subscribe</option>
+        </select>
+        
+        <textarea id="payload" placeholder="Payload (JSON)" rows="3" cols="50" style="width: 400px;"></textarea>
+        <button onclick="sendMessage()">Send</button>
+    </div>
+    
+    <div>
+        <h4>Quick Payloads:</h4>
+        <button onclick="setPayload('ping')">Ping</button>
+        <button onclick="setPayload('send_message')">Send Text</button>
+        <button onclick="setPayload('subscribe_all')">Subscribe All</button>
+        <button onclick="setPayload('get_chats')">Get Chats</button>
+    </div>
+
+    <script>
+        let ws = null;
+        
+        function addMessage(type, content) {
+            const div = document.createElement('div');
+            div.className = type;
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${content}`;
+            document.getElementById('messages').appendChild(div);
+            document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+        }
+        
+        function connect() {
+            const serverUrl = document.getElementById('serverUrl').value;
+            const sessionId = document.getElementById('sessionId').value;
+            const apiKey = document.getElementById('apiKey').value;
+            
+            const url = `${serverUrl}?sid=${sessionId}&token=${apiKey}`;
+            
+            try {
+                ws = new WebSocket(url);
+                
+                ws.onopen = () => {
+                    document.getElementById('status').innerHTML = 'Status: <span class="connected">Connected</span>';
+                    addMessage('sent', 'Connected to WebSocket server');
+                };
+                
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    addMessage('received', `Received: ${JSON.stringify(data, null, 2)}`);
+                };
+                
+                ws.onerror = (error) => {
+                    addMessage('error', `Error: ${error.message}`);
+                };
+                
+                ws.onclose = () => {
+                    document.getElementById('status').innerHTML = 'Status: <span class="disconnected">Disconnected</span>';
+                    addMessage('error', 'Disconnected from server');
+                    ws = null;
+                };
+                
+            } catch (error) {
+                addMessage('error', `Connection error: ${error.message}`);
+            }
+        }
+        
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+        
+        function sendMessage() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addMessage('error', 'Not connected');
+                return;
+            }
+            
+            const type = document.getElementById('messageType').value;
+            const payloadText = document.getElementById('payload').value;
+            
+            let payload = {};
+            try {
+                if (payloadText) {
+                    payload = JSON.parse(payloadText);
+                }
+            } catch (e) {
+                addMessage('error', `Invalid JSON: ${e.message}`);
+                return;
+            }
+            
+            const requestId = `req_${Date.now()}`;
+            const message = {
+                type,
+                payload,
+                requestId
+            };
+            
+            ws.send(JSON.stringify(message));
+            addMessage('sent', `Sent: ${JSON.stringify(message, null, 2)}`);
+        }
+        
+        function setPayload(type) {
+            const payloads = {
+                ping: '{}',
+                send_message: JSON.stringify({
+                    jid: "5511999999999@s.whatsapp.net",
+                    content: "Hello from WebSocket!",
+                    type: "text"
+                }, null, 2),
+                subscribe_all: JSON.stringify({
+                    events: "all"
+                }, null, 2),
+                get_chats: JSON.stringify({
+                    archived: false
+                }, null, 2)
+            };
+            
+            if (payloads[type]) {
+                document.getElementById('payload').value = payloads[type];
+            }
+        }
+    </script>
+</body>
+</html>

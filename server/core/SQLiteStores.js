@@ -1783,14 +1783,101 @@ class SQLiteStores {
 
     /**
      * Create new session
-     * @param {string} id - Session ID
-     * @param {Object} data - Session data
-     * @returns {Promise<Object>} SQLite result
+     * @param {string} uid - User ID
+     * @param {Object} options - Session options
+     * @returns {Promise<Object>} Session info
      */
-    async createSession(id, data = {}) {
-        if (!id) throw new Error('Session ID required');
-        
-        return this.upsert('sessions', { id, ...data }, ['id']);
+    async createSession(uid, options = {}) {
+        const context = { uid, options };
+
+        try {
+            // Check if user exists
+            const user = await this.store.getUserByUsername(uid);
+            if (!user) {
+                throw new Error(`User ${uid} not found`);
+            }
+
+            // Get user's session limit
+            const userLimit = this.limits.get(uid) || this.maxPerUser;
+            const userCount = this.userSessions.get(uid)?.size || 0;
+
+            // Check per-user limit
+            if (userCount >= userLimit) {
+                throw new Error(`Max sessions (${userLimit}) reached for user`);
+            }
+
+            // Check total limit
+            if (this.sessions.size >= this.maxTotal) {
+                throw new Error('Max total sessions reached');
+            }
+
+            // Generate session ID if not provided
+            const sid = options.sid || uuidv4();
+            console.log(`📝 Creating session with ID: ${sid}`); // Debug log
+
+            // Check if session ID already exists in memory
+            if (this.sessions.has(sid)) {
+                throw new Error(`Session ID ${sid} already exists in memory`);
+            }
+
+            // Check if session already exists in database
+            const existingSession = await this.store.getSession(sid).catch(() => null);
+            if (existingSession) {
+                throw new Error(`Session ID ${sid} already exists in database`);
+            }
+
+            // Save to DB with retry
+            await retry(() =>
+                this.store.createSession(sid, {
+                    device_id: options.device || `device-${Date.now()}`,
+                    platform: options.platform || 'web',
+                    status: 'initializing',
+                    logged_in: 0
+                }), {
+                maxAttempts: 3,
+                onRetry: ({ attempt }) => console.log(`Retry ${attempt} for session creation`, { sid })
+            });
+
+            // Assign session to user
+            await this.store.assignUserSession(uid, sid);
+
+            // Create session handler instance
+            const sess = new SessionHandler(sid, uid, this.wss);
+            
+            // Initialize the session (this will create the db instance with sid)
+            await sess.init(this.dbPath);
+
+            // Store in memory
+            this.sessions.set(sid, sess);
+            
+            const userSet = this.userSessions.get(uid) || new Set();
+            userSet.add(sid);
+            this.userSessions.set(uid, userSet);
+
+            this.stats.created++;
+
+            // Log activity
+            await this.store.logActivity({
+                user_id: uid,
+                action: 'create_session',
+                resource: sid,
+                details: { platform: options.platform, device: options.device }
+            }).catch(() => { });
+
+            console.log(`✅ Session created successfully: ${sid}`); // Debug log
+            logger.info('Session created successfully', { sid, uid, platform: options.platform });
+
+            return {
+                sid,
+                qr: sess.qr,
+                state: sess.state
+            };
+
+        } catch (error) {
+            this.stats.errors++;
+            logger.error('Failed to create session', { ...context, error: error.message });
+            throw error;
+        }
     }
 
     /**

@@ -231,9 +231,30 @@ const getSessionClientCount = (wss, sessionId) => {
     return count;
 };
 
+const broadcastEvent = (wss, sessionId, event, data) => {
+    let sent = 0;
+    const message = JSON.stringify({ event, data });
+
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN && client.sessionId === sessionId) {
+            // Check if client is subscribed to this event
+            if (!client.subscriptions || 
+                client.subscriptions.has(event) || 
+                client.subscriptions.has('all')) {
+                client.send(message);
+                sent++;
+            }
+        }
+    });
+
+    return sent;
+};
+
+// Export the new function
 module.exports = {
     initWebSocket,
     broadcastToSession,
+    broadcastEvent, // Add this
     sendToClient,
     getConnectedClients,
     getSessionClientCount

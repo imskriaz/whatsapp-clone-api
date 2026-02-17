@@ -314,7 +314,8 @@ const handleSubscribe = (ws, payload, requestId) => {
         // Subscribe to all events
         const allEvents = [
             'message', 'presence', 'chat', 'reaction', 
-            'group', 'call', 'receipt', 'media'
+            'group', 'call', 'receipt', 'media', 'qr', // Add 'qr' here
+            'connection', 'disconnected', 'connected', 'error'
         ];
         allEvents.forEach(e => ws.subscriptions.add(e));
     }

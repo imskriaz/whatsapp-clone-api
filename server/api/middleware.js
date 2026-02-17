@@ -4,7 +4,8 @@ const { body, validationResult } = require('express-validator');
 const logger = require('../utils/logger');
 const { maskString } = require('../utils/helpers');
 const { ROLES, DEFAULT_PERMISSIONS, ERROR_CODES } = require('../utils/constants');
-
+const isDev = process.env.NODE_ENV === 'development';
+const disableRateLimit = process.env.DISABLE_RATE_LIMIT === 'true';
 /**
  * Role definitions and default permissions
  */
@@ -1074,6 +1075,27 @@ const cleanup = (req, res, next) => {
     });
     next();
 };
+
+const createAccountLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: isDev ? 100 : 5,
+    message: { error: 'Too many accounts created', code: 'RATE_LIMIT_EXCEEDED' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.ip,
+    skip: (req) => isDev && disableRateLimit // Skip if dev and disabled
+});
+
+// Also update login limiter similarly
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: process.env.NODE_ENV === 'development' ? 100 : 10,
+    message: { error: 'Too many login attempts', code: 'RATE_LIMIT_EXCEEDED' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.ip,
+    skip: (req) => process.env.NODE_ENV === 'development'
+});
 
 module.exports = {
     ROLES: ROLES_CONFIG,
