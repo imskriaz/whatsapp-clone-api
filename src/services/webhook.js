@@ -62,8 +62,9 @@ class WebhookService {
      */
     async loadFailedWebhooks() {
         try {
-            const failed = await this.store.getAll('webhooks', 
-                'WHERE failure_count > 0 AND enabled = 1'
+            // Fix: Use db.all directly instead of store.getAll
+            const failed = await this.store.db.all(
+                `SELECT * FROM webhooks WHERE failure_count > 0 AND enabled = 1`
             );
 
             for (const webhook of failed) {
@@ -83,6 +84,20 @@ class WebhookService {
 
         } catch (error) {
             logger.error('Failed to load failed webhooks', error);
+        }
+    }
+
+    /**
+     * Get failed webhooks
+     */
+    async getFailedWebhooks() {
+        try {
+            return await this.store.db.all(
+                `SELECT * FROM webhooks WHERE failure_count > 0 AND enabled = 1`
+            );
+        } catch (error) {
+            logger.error('Failed to get failed webhooks', error);
+            return [];
         }
     }
 
@@ -165,10 +180,10 @@ class WebhookService {
                         // Success
                         await this.store.updateWebhookStats(item.id, true, response.status);
                         this.stats.delivered++;
-                        logger.debug('Webhook delivered', { 
-                            id: item.id, 
+                        logger.debug('Webhook delivered', {
+                            id: item.id,
                             event: item.event,
-                            status: response.status 
+                            status: response.status
                         });
                     } else {
                         // HTTP error

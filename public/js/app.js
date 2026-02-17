@@ -9,7 +9,6 @@ class App {
     }
 
     async init() {
-        // Check authentication
         const authenticated = await auth.init();
         
         if (!authenticated) {
@@ -17,32 +16,24 @@ class App {
             return;
         }
 
-        // Load dashboard
         this.renderDashboard();
     }
 
     renderDashboard() {
-        const container = document.getElementById('app');
-        
-        // Load dashboard HTML
         fetch('/views/pages/dashboard.html')
             .then(res => res.text())
             .then(html => {
-                container.innerHTML = html;
+                document.getElementById('app').innerHTML = html;
                 
-                // Initialize components
                 this.sidebar = new Sidebar();
                 this.chat = new ChatArea();
                 
-                // Render components
                 document.querySelector('.sidebar-container').innerHTML = this.sidebar.render();
-                document.querySelector('.chat-container').innerHTML = this.chat.render();
+                document.querySelector('.chat-area-container').innerHTML = this.chat.render();
                 
-                // Attach events
                 this.sidebar.attachEvents();
                 this.chat.attachEvents();
                 
-                // Load sessions
                 this.loadSessions();
             });
     }
@@ -52,10 +43,8 @@ class App {
             const sessions = await api.getSessions();
             
             if (sessions.length === 0) {
-                // Show create session modal
                 this.modals.show('session-manager', { onCreate: () => this.loadSessions() });
             } else {
-                // Use first active session
                 const activeSession = sessions.find(s => s.connected) || sessions[0];
                 this.setCurrentSession(activeSession.sid);
             }
@@ -67,13 +56,9 @@ class App {
     setCurrentSession(sid) {
         this.currentSession = sid;
         
-        // Connect WebSocket
         ws.connect(sid);
-        
-        // Load chats
         this.sidebar.loadChats(sid);
         
-        // Set up WebSocket listeners
         ws.on('message', (data) => {
             if (data.chat === this.currentChat) {
                 this.chat.loadMessages(sid, this.currentChat);
@@ -93,7 +78,6 @@ class App {
         this.chat.currentChat = jid;
         this.chat.loadMessages(this.currentSession, jid);
         
-        // Load contact info
         api.getContact(this.currentSession, jid).then(contact => {
             this.chat.contact = contact;
             this.chat.render();
@@ -104,7 +88,6 @@ class App {
     }
 }
 
-// Initialize app when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
     window.app = new App();
     app.init();

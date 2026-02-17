@@ -90,7 +90,11 @@ class SessionsManager {
         logger.info('Restoring active sessions...');
 
         try {
-            const sessions = await this.store.all('sessions', 'WHERE logged_in = 1');
+            // Fix: Use db.all directly instead of store.all which requires sessionId
+            const sessions = await this.store.db.all(
+                `SELECT * FROM sessions WHERE logged_in = 1`
+            );
+            
             let restored = 0;
             let failed = 0;
 
@@ -107,7 +111,7 @@ class SessionsManager {
                     logger.error(`Failed to restore session ${s.id}`, { error: err.message });
 
                     // Mark as logged out in DB
-                    await this.store.updateSession(s.id, { logged_in: 0 }).catch(() => { });
+                    await this.store.updateSession(s.id, { logged_in: 0 }).catch(() => {});
                 }
             }
 

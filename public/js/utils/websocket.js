@@ -1,4 +1,4 @@
-// public/js/websocket.js
+// public/js/utils/websocket.js
 class WhatsAppWebSocket {
     constructor() {
         this.ws = null;

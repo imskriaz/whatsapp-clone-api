@@ -1,0 +1,37 @@
+// .nodemonrc
+{
+  // Files to watch
+  watch: ["src", "app.js"],
+  
+  // Files to ignore
+  ignore: [
+    "node_modules/*",
+    "data/*",
+    "logs/*",
+    "public/*",
+    "tests/*",
+    "*.test.js",
+    "*.spec.js"
+  ],
+  
+  // File extensions to watch
+  ext: "js,json",
+  
+  // Delay before restart
+  delay: 1000,
+  
+  // Map file extensions to exec commands
+  execMap: {
+    js: "node --trace-warnings"
+  },
+  
+  // Environment variables
+  env: {
+    NODE_ENV: "development"
+  },
+  
+  // Events
+  events: {
+    restart: "echo '🔄 App restarted'"
+  }
+}

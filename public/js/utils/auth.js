@@ -1,4 +1,4 @@
-// public/js/auth.js
+// public/js/utils/auth.js
 class AuthManager {
     constructor() {
         this.apiKey = localStorage.getItem('apiKey');

@@ -133,8 +133,6 @@ class SQLiteStores {
         };
     }
 
-    // ==================== INIT ====================
-
     /**
      * Initialize database connection and create tables
      * @returns {Promise<this>}
@@ -160,21 +158,8 @@ class SQLiteStores {
                     mode: sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE
                 });
 
-                // Set essential pragmas only (remove non-essential ones for startup)
-                await this.db.exec('PRAGMA foreign_keys = ON');
-                await this.db.exec('PRAGMA journal_mode = WAL');
-                await this.db.exec('PRAGMA synchronous = NORMAL');
-                
-                // Defer less critical pragmas
-                setImmediate(async () => {
-                    try {
-                        await this.db.exec('PRAGMA cache_size = -2000');
-                        await this.db.exec('PRAGMA temp_store = MEMORY');
-                        await this.db.exec('PRAGMA mmap_size = 30000000000');
-                    } catch (e) {
-                        // Ignore errors
-                    }
-                });
+                // Call _setPragmas here!
+                await this._setPragmas();
 
                 // Create tables if not exist (fast check)
                 const tablesExist = await this.db.get(
@@ -187,7 +172,7 @@ class SQLiteStores {
 
                 this._emit('init', { sessionId: this.sessionId });
                 
-                console.log(`[SQLite] Initialized: ${this.dbPath} in ${Date.now() - global.appStart}ms`);
+                console.log(`[SQLite] Initialized: ${this.dbPath}`);
                 return this;
 
             } catch (error) {
@@ -228,8 +213,6 @@ class SQLiteStores {
                 console.warn(`[SQLite] Failed to set pragma: ${pragma}`, error.message);
             }
         }
-
-        this.pragmaSet = true;
     }
 
     /**
@@ -735,8 +718,6 @@ class SQLiteStores {
         }
     }
 
-    // ==================== CALLBACK SYSTEM ====================
-
     /**
      * Register event callback
      * @param {string} event - Event name
@@ -772,8 +753,6 @@ class SQLiteStores {
             }
         }
     }
-
-    // ==================== TRANSACTION MANAGEMENT ====================
 
     /**
      * Begin transaction
@@ -815,8 +794,6 @@ class SQLiteStores {
             throw error;
         }
     }
-
-    // ==================== GENERIC CRUD ====================
 
     /**
      * Insert or update record with retry logic
@@ -1085,6 +1062,27 @@ class SQLiteStores {
         }
     }
 
+
+    /**
+     * Execute a raw SQL query without sessionId
+     * @param {string} sql - SQL query
+     * @param {Array} params - Query parameters
+     * @returns {Promise<Array>} Results
+     */
+    async rawAll(sql, params = []) {
+        return this.db.all(sql, params);
+    }
+
+    /**
+     * Get all records from a table without session filtering
+     * @param {string} table - Table name
+     * @param {string} where - WHERE clause
+     * @param {Array} params - Parameters
+     * @returns {Promise<Array>} Results
+     */
+    async getAll(table, where = '', params = []) {
+        return this.db.all(`SELECT * FROM ${table} ${where}`, params);
+    }
     /**
      * Delete record
      * @param {string} table - Table name

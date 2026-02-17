@@ -7,7 +7,7 @@ const { formatBytes } = require('../utils/helpers');
 class StatsService {
     constructor(manager, store, config) {
         this.manager = manager;
-        this.store = store;
+        this.store = store; // This is the global store (sessionId = null)
         this.config = config;
         this.isRunning = false;
         this.schedule = null;
@@ -89,27 +89,57 @@ class StatsService {
                 nodeVersion: process.version
             };
 
-            // Database stats
-            const dbSize = await this.store.getDbSize();
-            const db = {
-                size: dbSize,
-                sizeFormatted: formatBytes(dbSize),
-                sessions: (await this.store.all('sessions')).length,
-                users: (await this.store.all('users')).length,
-                chats: (await this.store.all('chats')).length,
-                messages: (await this.store.all('msgs')).length,
-                media: (await this.store.all('media')).length
+            // Database stats - Using store directly (global instance)
+            // For tables that don't require sessionId, we need to query differently
+            let db = {
+                size: 0,
+                sizeFormatted: '0 B',
+                sessions: 0,
+                users: 0,
+                chats: 0,
+                messages: 0,
+                media: 0
             };
 
+            try {
+                db.size = await this.store.getDbSize();
+                db.sizeFormatted = formatBytes(db.size);
+                
+                // These queries don't need sessionId
+                db.sessions = await this.store.db.get(
+                    `SELECT COUNT(*) as count FROM sessions`
+                ).then(r => r?.count || 0);
+                
+                db.users = await this.store.db.get(
+                    `SELECT COUNT(*) as count FROM users`
+                ).then(r => r?.count || 0);
+                
+                // For session-specific tables, we need to sum across all sessions
+                db.chats = await this.store.db.get(
+                    `SELECT COUNT(*) as count FROM chats`
+                ).then(r => r?.count || 0);
+                
+                db.messages = await this.store.db.get(
+                    `SELECT COUNT(*) as count FROM msgs`
+                ).then(r => r?.count || 0);
+                
+                db.media = await this.store.db.get(
+                    `SELECT COUNT(*) as count FROM media`
+                ).then(r => r?.count || 0);
+                
+            } catch (dbErr) {
+                logger.error('Failed to get database stats', dbErr);
+            }
+
             // Session manager stats
-            const manager = this.manager.getStats();
+            const managerStats = this.manager.getStats();
 
             const stats = {
                 timestamp,
                 system,
                 app,
                 db,
-                manager,
+                manager: managerStats,
                 services: this.getServiceStatus()
             };
 

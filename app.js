@@ -394,9 +394,6 @@ class App {
         this.app.use(jsonParser);
         this.app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-        // Static files
-        this.app.use('/public', express.static(path.join(__dirname, 'public')));
-
         // Request logging
         this.app.use(requestLogger);
 
@@ -413,10 +410,15 @@ class App {
         // Response time header
         this.app.use((req, res, next) => {
             const start = Date.now();
+            
+            // Use a listener instead of trying to set header after response
             res.on('finish', () => {
                 const duration = Date.now() - start;
-                res.setHeader('X-Response-Time', `${duration}ms`);
+                // This is safe because response is already finished
+                // But we can't set headers here
+                logger.debug(`${req.method} ${req.url} - ${duration}ms`);
             });
+            
             next();
         });
 
@@ -445,14 +447,15 @@ class App {
         this.app.use('/api', routes(this.manager, this.store));
 
         // Web routes (mounted at root)
-        const webRoutes = require('./src/web/routes');
-        this.app.use('/', webRoutes);
-
-        // Static files
-        this.app.use('/public', express.static(path.join(__dirname, 'public')));
+        // Serve static files - IMPORTANT: These must come BEFORE the 404 handler
         this.app.use('/css', express.static(path.join(__dirname, 'public/css')));
         this.app.use('/js', express.static(path.join(__dirname, 'public/js')));
         this.app.use('/views', express.static(path.join(__dirname, 'public/views')));
+        this.app.use('/public', express.static(path.join(__dirname, 'public')));
+
+        // Web routes (UI)
+        const webRoutes = require('./src/web/routes');
+        this.app.use('/', webRoutes);
 
         // 404 handler for API routes (non-web)
         this.app.use('/api/*', (req, res) => {
@@ -469,6 +472,25 @@ class App {
             res.status(404).sendFile(path.join(__dirname, 'public/views/pages/404.html'));
         });
 
+        // 404 handler - MUST be last
+        this.app.use((req, res) => {
+            // Check if headers already sent
+            if (res.headersSent) {
+                return;
+            }
+            
+            // Try to serve 404.html
+            const filePath = path.join(__dirname, 'public/views/pages/404.html');
+            if (fs.existsSync(filePath)) {
+                res.status(404).sendFile(filePath);
+            } else {
+                res.status(404).json({ 
+                    error: 'Route not found',
+                    code: 'NOT_FOUND',
+                    path: req.url 
+                });
+            }
+        });
         // Error handler
         this.app.use(errorHandler);
 
