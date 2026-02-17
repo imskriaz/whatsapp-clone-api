@@ -1,0 +1,12 @@
+{
+  "watch": ["src", "app.js", "web.js"],
+  "ignore": ["node_modules/*", "data/*", "logs/*", "public/*", "tests/*"],
+  "ext": "js,json",
+  "delay": "1000",
+  "execMap": {
+    "js": "node --trace-warnings"
+  },
+  "env": {
+    "NODE_ENV": "development"
+  }
+}

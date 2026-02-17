@@ -1,0 +1,33 @@
+<div class="chat-header">
+    <div class="flex items-center">
+        <div class="chat-avatar">
+            <i class="fa-solid fa-user"></i>
+        </div>
+        <span class="font-semibold ml-2">{{username}}</span>
+    </div>
+    <div class="flex items-center space-x-4">
+        <button class="profile-trigger">
+            <i class="fa-solid fa-ellipsis-vertical"></i>
+        </button>
+    </div>
+    
+    <div class="profile-dropdown hidden">
+        <div class="dropdown-menu">
+            <div class="py-2">
+                <a href="#" class="block px-4 py-2 hover:bg-gray-100" data-action="profile">
+                    <i class="fa-solid fa-user mr-2"></i>Profile
+                </a>
+                <a href="#" class="block px-4 py-2 hover:bg-gray-100" data-action="sessions">
+                    <i class="fa-solid fa-layer-group mr-2"></i>Sessions
+                </a>
+                <a href="#" class="block px-4 py-2 hover:bg-gray-100" data-action="settings">
+                    <i class="fa-solid fa-gear mr-2"></i>Settings
+                </a>
+                <hr class="my-2">
+                <a href="#" class="block px-4 py-2 hover:bg-gray-100 text-red-600" data-action="logout">
+                    <i class="fa-solid fa-sign-out-alt mr-2"></i>Logout
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
